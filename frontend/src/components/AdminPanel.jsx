@@ -13,7 +13,7 @@ export default function AdminPanel({ socket }) {
   useEffect(() => {
     socket.emit('join_admin');
 
-    fetch('http://localhost:3000/api/orders')
+    fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:3000'}/api/orders`)
       .then(res => res.json())
       .then(data => setOrders(data));
 
@@ -47,7 +47,7 @@ export default function AdminPanel({ socket }) {
       formData.append('menuImage', file);
       
       try {
-          const res = await fetch('http://localhost:3000/api/menu/upload', {
+          const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:3000'}/api/menu/upload`, {
               method: 'POST',
               body: formData
           });
@@ -63,7 +63,7 @@ export default function AdminPanel({ socket }) {
 
   const publishMenu = async () => {
       try {
-          const res = await fetch('http://localhost:3000/api/menu/publish', {
+          const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:3000'}/api/menu/publish`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ categories: parsedMenu })
