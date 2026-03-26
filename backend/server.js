@@ -11,6 +11,161 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
+const DEFAULT_VENUE_SETTINGS = Object.freeze({
+  restaurant_name: 'Mozzo',
+  restaurant_subtitle: '',
+  contact_label: '',
+  contact_url: '',
+  review_url: '',
+  feedback_url: '',
+  updated_at: null
+});
+
+function runDbStatement(query, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(query, params, function statementCallback(err) {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve(this);
+    });
+  });
+}
+
+function getDbRow(query, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(query, params, (err, row) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve(row);
+    });
+  });
+}
+
+function isValidHttpUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch (_error) {
+    return false;
+  }
+}
+
+function normalizeOptionalUrl(value) {
+  const trimmed = String(value || '').trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  if (/^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(trimmed)) {
+    return trimmed;
+  }
+
+  return `https://${trimmed}`;
+}
+
+function normalizeVenueSettingsInput(input = {}) {
+  return {
+    restaurant_name: String(input.restaurant_name || '').trim(),
+    restaurant_subtitle: String(input.restaurant_subtitle || '').trim(),
+    contact_label: String(input.contact_label || '').trim(),
+    contact_url: normalizeOptionalUrl(input.contact_url),
+    review_url: normalizeOptionalUrl(input.review_url),
+    feedback_url: normalizeOptionalUrl(input.feedback_url)
+  };
+}
+
+function validateVenueSettingsInput(input) {
+  const errors = {};
+  if (!input.restaurant_name) {
+    errors.restaurant_name = 'El nombre del local es obligatorio.';
+  }
+
+  if ((input.contact_label && !input.contact_url) || (!input.contact_label && input.contact_url)) {
+    errors.contact = 'Completá etiqueta y URL de contacto, o dejá ambos vacíos.';
+  }
+
+  ['contact_url', 'review_url', 'feedback_url'].forEach((field) => {
+    if (input[field] && !isValidHttpUrl(input[field])) {
+      errors[field] = 'Ingresá una URL válida con http o https.';
+    }
+  });
+
+  return errors;
+}
+
+function mergeVenueSettings(row) {
+  if (!row) {
+    return { ...DEFAULT_VENUE_SETTINGS };
+  }
+
+  return {
+    restaurant_name: row.restaurant_name || DEFAULT_VENUE_SETTINGS.restaurant_name,
+    restaurant_subtitle: row.restaurant_subtitle || '',
+    contact_label: row.contact_label || '',
+    contact_url: row.contact_url || '',
+    review_url: row.review_url || '',
+    feedback_url: row.feedback_url || '',
+    updated_at: row.updated_at || null
+  };
+}
+
+async function readVenueSettings() {
+  const row = await getDbRow(
+    `SELECT restaurant_name, restaurant_subtitle, contact_label, contact_url, review_url, feedback_url, updated_at
+     FROM venue_settings
+     WHERE id = 1`
+  );
+
+  return mergeVenueSettings(row);
+}
+
+async function saveVenueSettings(input) {
+  const normalized = normalizeVenueSettingsInput(input);
+  const errors = validateVenueSettingsInput(normalized);
+
+  if (Object.keys(errors).length > 0) {
+    const error = new Error('Invalid venue settings');
+    error.statusCode = 400;
+    error.fields = errors;
+    throw error;
+  }
+
+  await runDbStatement(
+    `INSERT INTO venue_settings (
+      id,
+      restaurant_name,
+      restaurant_subtitle,
+      contact_label,
+      contact_url,
+      review_url,
+      feedback_url,
+      updated_at
+    ) VALUES (1, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(id) DO UPDATE SET
+      restaurant_name = excluded.restaurant_name,
+      restaurant_subtitle = excluded.restaurant_subtitle,
+      contact_label = excluded.contact_label,
+      contact_url = excluded.contact_url,
+      review_url = excluded.review_url,
+      feedback_url = excluded.feedback_url,
+      updated_at = CURRENT_TIMESTAMP`,
+    [
+      normalized.restaurant_name,
+      normalized.restaurant_subtitle,
+      normalized.contact_label,
+      normalized.contact_url,
+      normalized.review_url,
+      normalized.feedback_url
+    ]
+  );
+
+  return readVenueSettings();
+}
+
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
     if (!fs.existsSync('uploads/')) fs.mkdirSync('uploads/');
@@ -35,6 +190,32 @@ const io = socketIo(server, {
 app.use(cors());
 app.use(express.json());
 app.use(morgan('dev'));
+
+app.get('/api/venue-settings', async (_req, res) => {
+  try {
+    const settings = await readVenueSettings();
+    res.json(settings);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/admin/venue-settings', async (req, res) => {
+  try {
+    const settings = await saveVenueSettings(req.body);
+    io.emit('venue_settings_updated');
+    res.json(settings);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({
+      error: error.statusCode
+        ? 'Configuración inválida.'
+        : error.code === 'SQLITE_READONLY'
+          ? 'La base de datos actual quedó en modo solo lectura. Reiniciá el backend para volver a guardar.'
+          : error.message,
+      fields: error.fields || undefined
+    });
+  }
+});
 
 // 1. Get Menu
 app.get('/api/menu', (req, res) => {

@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react';
 import { ShoppingBag, Plus, Minus, X, CheckCircle, Send } from 'lucide-react';
+import { getVisibleVenueLinks } from '../lib/venueSettings';
 
-export default function Menu({ tableId, socket }) {
+export default function Menu({ tableId, socket, venueSettings }) {
   const [categories, setCategories] = useState([]);
   const [loading, setLoading] = useState(true);
   const [cart, setCart] = useState([]);
@@ -81,6 +82,7 @@ export default function Menu({ tableId, socket }) {
 
   const cartTotal = cart.reduce((sum, item) => sum + (item.price * item.quantity), 0);
   const cartItemsCount = cart.reduce((sum, item) => sum + item.quantity, 0);
+  const venueLinks = getVisibleVenueLinks(venueSettings);
 
   if (loading) return <div className="loader"></div>;
 
@@ -107,6 +109,33 @@ export default function Menu({ tableId, socket }) {
           </div>
         </div>
       ))}
+
+      {(venueSettings.restaurant_subtitle || venueLinks.length > 0) && (
+        <div className="venue-links-panel glass-panel">
+          <div>
+            <h3 className="venue-links-title">{venueSettings.restaurant_name}</h3>
+            {venueSettings.restaurant_subtitle && (
+              <p className="venue-links-subtitle">{venueSettings.restaurant_subtitle}</p>
+            )}
+          </div>
+
+          {venueLinks.length > 0 && (
+            <div className="venue-links-actions">
+              {venueLinks.map(link => (
+                <a
+                  key={link.key}
+                  className="btn"
+                  href={link.url}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {link.label}
+                </a>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {orderConfirmed && (
         <div style={{position:'fixed', top: '20px', right: '20px', background: 'var(--success)', padding: '16px 24px', borderRadius: '12px', zIndex: 1000, boxShadow: '0 4px 12px rgba(0,0,0,0.3)', display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 'bold'}}>

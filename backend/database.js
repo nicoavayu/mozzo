@@ -1,18 +1,22 @@
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const { runCreateVenueSettingsMigration } = require('./migrations/001_create_venue_settings');
 
-const dbPath = path.resolve(__dirname, 'database.sqlite');
+const dbPath = process.env.DB_PATH
+  ? path.resolve(process.env.DB_PATH)
+  : path.resolve(__dirname, 'database.sqlite');
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
     console.error('Error opening database', err.message);
   } else {
     console.log('Connected to SQLite database.');
-    db.run(`CREATE TABLE IF NOT EXISTS menu_categories (
+    db.serialize(() => {
+      db.run(`CREATE TABLE IF NOT EXISTS menu_categories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL
     )`);
-    
-    db.run(`CREATE TABLE IF NOT EXISTS menu_items (
+
+      db.run(`CREATE TABLE IF NOT EXISTS menu_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         category_id INTEGER,
         name TEXT NOT NULL,
@@ -21,14 +25,14 @@ const db = new sqlite3.Database(dbPath, (err) => {
         FOREIGN KEY (category_id) REFERENCES menu_categories (id)
     )`);
 
-    db.run(`CREATE TABLE IF NOT EXISTS orders (
+      db.run(`CREATE TABLE IF NOT EXISTS orders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         table_id INTEGER NOT NULL,
         status TEXT DEFAULT 'pending',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    db.run(`CREATE TABLE IF NOT EXISTS order_items (
+      db.run(`CREATE TABLE IF NOT EXISTS order_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         order_id INTEGER,
         item_id INTEGER,
@@ -36,8 +40,11 @@ const db = new sqlite3.Database(dbPath, (err) => {
         comments TEXT,
         FOREIGN KEY (order_id) REFERENCES orders (id),
         FOREIGN KEY (item_id) REFERENCES menu_items (id)
-    )`, () => {
+    )`);
+
+      runCreateVenueSettingsMigration(db, () => {
         seedDB();
+      });
     });
   }
 });

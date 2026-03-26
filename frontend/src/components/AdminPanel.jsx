@@ -1,7 +1,10 @@
 import { useState, useEffect } from 'react';
 import { ChefHat, Check, Clock, Play, Upload, Save, X } from 'lucide-react';
+import { normalizeVenueSettings, prepareVenueSettingsPayload, validateVenueSettingsForm } from '../lib/venueSettings';
 
-export default function AdminPanel({ socket }) {
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+
+export default function AdminPanel({ socket, venueSettings, onVenueSettingsSaved }) {
   const [orders, setOrders] = useState([]);
   const [activeTab, setActiveTab] = useState('kanban');
   
@@ -9,11 +12,16 @@ export default function AdminPanel({ socket }) {
   const [file, setFile] = useState(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [parsedMenu, setParsedMenu] = useState(null);
+  const [settingsForm, setSettingsForm] = useState(normalizeVenueSettings(venueSettings));
+  const [settingsErrors, setSettingsErrors] = useState({});
+  const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const [settingsFeedback, setSettingsFeedback] = useState('');
+  const [settingsFeedbackType, setSettingsFeedbackType] = useState('success');
 
   useEffect(() => {
     socket.emit('join_admin');
 
-    fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:3000'}/api/orders`)
+    fetch(`${API_URL}/api/orders`)
       .then(res => res.json())
       .then(data => setOrders(data));
 
@@ -34,6 +42,10 @@ export default function AdminPanel({ socket }) {
     };
   }, [socket]);
 
+  useEffect(() => {
+    setSettingsForm(normalizeVenueSettings(venueSettings));
+  }, [venueSettings]);
+
   const updateStatus = (orderId, newStatus) => {
     socket.emit('update_order_status', { order_id: orderId, status: newStatus });
   };
@@ -47,7 +59,7 @@ export default function AdminPanel({ socket }) {
       formData.append('menuImage', file);
       
       try {
-          const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:3000'}/api/menu/upload`, {
+          const res = await fetch(`${API_URL}/api/menu/upload`, {
               method: 'POST',
               body: formData
           });
@@ -63,7 +75,7 @@ export default function AdminPanel({ socket }) {
 
   const publishMenu = async () => {
       try {
-          const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:3000'}/api/menu/publish`, {
+          const res = await fetch(`${API_URL}/api/menu/publish`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ categories: parsedMenu })
@@ -89,6 +101,56 @@ export default function AdminPanel({ socket }) {
       const newMenu = [...parsedMenu];
       newMenu[catIdx].name = value;
       setParsedMenu(newMenu);
+  };
+
+  const updateSettingsField = (field, value) => {
+    setSettingsForm(prev => ({ ...prev, [field]: value }));
+    setSettingsErrors(prev => ({ ...prev, [field]: undefined, contact: field === 'contact_label' || field === 'contact_url' ? undefined : prev.contact }));
+    setSettingsFeedback('');
+    setSettingsFeedbackType('success');
+  };
+
+  const saveVenueSettings = async () => {
+    const validationErrors = validateVenueSettingsForm(settingsForm);
+    if (Object.keys(validationErrors).length > 0) {
+      setSettingsErrors(validationErrors);
+      setSettingsFeedback('Revisá los campos marcados antes de guardar.');
+      setSettingsFeedbackType('error');
+      return;
+    }
+
+    setIsSavingSettings(true);
+    setSettingsFeedback('');
+    setSettingsFeedbackType('success');
+
+    try {
+      const response = await fetch(`${API_URL}/api/admin/venue-settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(prepareVenueSettingsPayload(settingsForm))
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        setSettingsErrors(data.fields || {});
+        setSettingsFeedback(data.error || 'No pudimos guardar la configuración.');
+        setSettingsFeedbackType('error');
+        return;
+      }
+
+      const normalized = normalizeVenueSettings(data);
+      setSettingsForm(normalized);
+      setSettingsErrors({});
+      setSettingsFeedback('Configuración guardada.');
+      setSettingsFeedbackType('success');
+      onVenueSettingsSaved(normalized);
+    } catch {
+      setSettingsFeedback('No pudimos guardar la configuración.');
+      setSettingsFeedbackType('error');
+    } finally {
+      setIsSavingSettings(false);
+    }
   };
 
   const pendingOrders = orders.filter(o => o.status === 'pending');
@@ -127,13 +189,19 @@ export default function AdminPanel({ socket }) {
   return (
     <div className="app-container">
       <header className="app-header">
-        <div className="logo">
-          <ChefHat size={32} color="var(--accent-color)" />
-          <span>Mozzo Admin</span>
+        <div className="brand-block">
+          <div className="logo">
+            <ChefHat size={32} color="var(--accent-color)" />
+            <span>{settingsForm.restaurant_name} Admin</span>
+          </div>
+          {settingsForm.restaurant_subtitle && (
+            <p className="brand-subtitle">{settingsForm.restaurant_subtitle}</p>
+          )}
         </div>
         <div style={{display: 'flex', gap: '10px'}}>
             <button className={`btn ${activeTab === 'kanban' ? 'btn-primary' : ''}`} onClick={() => setActiveTab('kanban')}>Tablero Realtime</button>
             <button className={`btn ${activeTab === 'menu_import' ? 'btn-primary' : ''}`} onClick={() => setActiveTab('menu_import')}>Importar Menú (Foto)</button>
+            <button className={`btn ${activeTab === 'venue_settings' ? 'btn-primary' : ''}`} onClick={() => setActiveTab('venue_settings')}>Configurar Local</button>
         </div>
       </header>
 
@@ -214,6 +282,94 @@ export default function AdminPanel({ socket }) {
                  </div>
              )}
           </div>
+      )}
+
+      {activeTab === 'venue_settings' && (
+        <div className="glass-panel settings-panel">
+          <div className="settings-panel-header">
+            <div>
+              <h2>Configuración básica del local</h2>
+              <p>Actualizá la identidad visible y los links operativos básicos sin tocar el deploy.</p>
+            </div>
+            <button className="btn btn-primary" onClick={saveVenueSettings} disabled={isSavingSettings}>
+              <Save size={16} /> {isSavingSettings ? 'Guardando...' : 'Guardar cambios'}
+            </button>
+          </div>
+
+          <div className="settings-grid">
+            <label className="settings-field">
+              <span>Nombre del local</span>
+              <input
+                className="settings-input"
+                value={settingsForm.restaurant_name}
+                onChange={(event) => updateSettingsField('restaurant_name', event.target.value)}
+                placeholder="Mozzo"
+              />
+              {settingsErrors.restaurant_name && <small className="settings-error">{settingsErrors.restaurant_name}</small>}
+            </label>
+
+            <label className="settings-field settings-field-wide">
+              <span>Subtítulo</span>
+              <input
+                className="settings-input"
+                value={settingsForm.restaurant_subtitle}
+                onChange={(event) => updateSettingsField('restaurant_subtitle', event.target.value)}
+                placeholder="Una descripción corta del local"
+              />
+            </label>
+
+            <label className="settings-field">
+              <span>Etiqueta de contacto</span>
+              <input
+                className="settings-input"
+                value={settingsForm.contact_label}
+                onChange={(event) => updateSettingsField('contact_label', event.target.value)}
+                placeholder="WhatsApp"
+              />
+            </label>
+
+            <label className="settings-field">
+              <span>URL de contacto</span>
+              <input
+                className="settings-input"
+                value={settingsForm.contact_url}
+                onChange={(event) => updateSettingsField('contact_url', event.target.value)}
+                placeholder="https://wa.me/..."
+              />
+              {(settingsErrors.contact || settingsErrors.contact_url) && (
+                <small className="settings-error">{settingsErrors.contact || settingsErrors.contact_url}</small>
+              )}
+            </label>
+
+            <label className="settings-field">
+              <span>Link de reseñas</span>
+              <input
+                className="settings-input"
+                value={settingsForm.review_url}
+                onChange={(event) => updateSettingsField('review_url', event.target.value)}
+                placeholder="https://..."
+              />
+              {settingsErrors.review_url && <small className="settings-error">{settingsErrors.review_url}</small>}
+            </label>
+
+            <label className="settings-field">
+              <span>Link de sugerencias</span>
+              <input
+                className="settings-input"
+                value={settingsForm.feedback_url}
+                onChange={(event) => updateSettingsField('feedback_url', event.target.value)}
+                placeholder="https://..."
+              />
+              {settingsErrors.feedback_url && <small className="settings-error">{settingsErrors.feedback_url}</small>}
+            </label>
+          </div>
+
+          {settingsFeedback && (
+            <div className={`settings-feedback ${settingsFeedbackType === 'error' ? 'settings-feedback-error' : 'settings-feedback-success'}`}>
+              {settingsFeedback}
+            </div>
+          )}
+        </div>
       )}
     </div>
   );

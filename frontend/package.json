@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "check": "npm run lint && npm run build",
+    "test:sprint4": "node scripts/test-sprint4.js"
   },
   "dependencies": {
     "lucide-react": "^1.0.1",

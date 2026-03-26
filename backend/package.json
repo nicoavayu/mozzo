@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "check": "node --check server.js && node --check database.js && node --check migrations/001_create_venue_settings.js && node --check scripts/smoke.js && node --check scripts/test-sprint4.js",
+    "smoke": "node scripts/smoke.js",
+    "test:sprint4": "node scripts/test-sprint4.js"
   },
   "keywords": [],
   "author": "",
