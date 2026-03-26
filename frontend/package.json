@@ -15,6 +15,7 @@
     "test:sprint2": "node scripts/test-sprint2.js",
     "test:sprint3": "node scripts/test-sprint3.js",
     "test:sprint4": "node scripts/test-sprint4.js",
+    "test:sprint6": "node scripts/test-sprint6.js",
     "preview": "vite preview"
   },
   "dependencies": {

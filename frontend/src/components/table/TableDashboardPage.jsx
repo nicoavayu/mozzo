@@ -125,13 +125,13 @@ export default function TableDashboardPage() {
         <DashboardActionCard
           icon={Receipt}
           title="Pedir la cuenta"
-          subtitle={isBillAttended ? 'Cuenta atendida' : isBillRequested ? 'Cuenta pedida' : ''}
+          subtitle={isBillAttended ? 'Cuenta entregada' : isBillRequested ? 'Cuenta pedida' : ''}
           hint={
             !canRequestBill && !isBillRequested
               ? 'Necesitás un pedido enviado'
               : ''
           }
-          badge={isBillAttended ? 'Atendida' : isBillRequested ? 'Solicitada' : ''}
+          badge={isBillAttended ? 'Entregada' : isBillRequested ? 'Solicitada' : ''}
           disabled={!canRequestBill || Boolean(submittingRequestType) || isBillRequested}
           onClick={handleBillAction}
         />

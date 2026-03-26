@@ -8,6 +8,14 @@ import {
   validateVenueSettingsForm,
 } from '../lib/venueSettings';
 import {
+  buildHistoryQuery,
+  DEFAULT_HISTORY_FILTERS,
+  formatHistoryMinutes,
+  formatHistoryPaymentMethod,
+  HISTORY_PAYMENT_METHOD_OPTIONS,
+  HISTORY_PRESET_OPTIONS,
+} from '../lib/orderHistory';
+import {
   buildDraftFromExternalMenu,
   EXTERNAL_AI_MENU_JSON_EXAMPLES,
   EXTERNAL_AI_MENU_PROMPTS,
@@ -92,6 +100,20 @@ const TABLE_REQUEST_TYPE_CONFIG = {
     className: 'is-bill',
     helper: 'La mesa pidió la cuenta.'
   }
+};
+
+const PAYMENT_METHOD_OPTIONS = [
+  { value: 'cash', label: 'Efectivo' },
+  { value: 'card', label: 'Tarjeta' },
+  { value: 'transfer', label: 'Transferencia' },
+  { value: 'other', label: 'Otro' },
+];
+
+const PAYMENT_METHOD_LABELS = {
+  cash: 'Efectivo',
+  card: 'Tarjeta',
+  transfer: 'Transferencia',
+  other: 'Otro',
 };
 
 const REVIEW_REASON_LABELS = {
@@ -181,6 +203,19 @@ function formatOrderTime(value) {
   return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+function formatOrderDateTime(value) {
+  if (!value) {
+    return '';
+  }
+
+  return new Date(value).toLocaleString([], {
+    day: '2-digit',
+    month: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
 function formatDurationMinutes(start, end) {
   if (!start || !end) {
     return '';
@@ -198,6 +233,10 @@ function formatDurationMinutes(start, end) {
 
 function formatMenuMoney(value) {
   return `$${Number(value || 0).toFixed(2)}`;
+}
+
+function formatPaymentMethodLabel(value) {
+  return PAYMENT_METHOD_LABELS[value] || 'Pago';
 }
 
 function sortTables(tables = []) {
@@ -575,9 +614,20 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
   const [tableRequestsError, setTableRequestsError] = useState('');
   const [tableRequestsActionError, setTableRequestsActionError] = useState('');
   const [resolvingRequestId, setResolvingRequestId] = useState(null);
-  const [closingTableId, setClosingTableId] = useState(null);
+  const [payingTableId, setPayingTableId] = useState(null);
+  const [paymentMethodDrafts, setPaymentMethodDrafts] = useState({});
   const [showResolvedTableRequests, setShowResolvedTableRequests] = useState(false);
   const [showDeliveredOrders, setShowDeliveredOrders] = useState(false);
+  const [historyFiltersDraft, setHistoryFiltersDraft] = useState(() => ({ ...DEFAULT_HISTORY_FILTERS }));
+  const [historyFilters, setHistoryFilters] = useState(() => ({ ...DEFAULT_HISTORY_FILTERS }));
+  const [historyOrders, setHistoryOrders] = useState([]);
+  const [historyOrdersStatus, setHistoryOrdersStatus] = useState('loading');
+  const [historyOrdersError, setHistoryOrdersError] = useState('');
+  const [historySummary, setHistorySummary] = useState(null);
+  const [historySummaryStatus, setHistorySummaryStatus] = useState('loading');
+  const [historySummaryError, setHistorySummaryError] = useState('');
+  const [historyExpandedOrderId, setHistoryExpandedOrderId] = useState(null);
+  const [historyReloadKey, setHistoryReloadKey] = useState(0);
   const [tables, setTables] = useState([]);
   const [tablesStatus, setTablesStatus] = useState('loading');
   const [tablesError, setTablesError] = useState('');
@@ -970,6 +1020,10 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
         return nextOrders;
       });
       setOrdersActionError('');
+
+      if (order?.closed_at) {
+        setHistoryReloadKey((current) => current + 1);
+      }
     };
 
     const handleTableRequestCreated = (request) => {
@@ -1036,19 +1090,104 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
     };
   }, [adminToken, onLogout, ordersReloadKey, socket]);
 
+  useEffect(() => {
+    if (activeTab !== 'history') {
+      return undefined;
+    }
+
+    let isMounted = true;
+    const queryString = buildHistoryQuery(historyFilters);
+
+    const loadHistoryOrders = async () => {
+      setHistoryOrdersStatus('loading');
+      setHistoryOrdersError('');
+
+      try {
+        const data = await apiRequest(`/api/admin/orders/history${queryString}`, { token: adminToken });
+
+        if (!isMounted) {
+          return;
+        }
+
+        const nextOrders = Array.isArray(data?.orders) ? data.orders : [];
+        setHistoryOrders(nextOrders);
+        setHistoryOrdersStatus(nextOrders.length > 0 ? 'ready' : 'empty');
+      } catch (error) {
+        if (!isMounted) {
+          return;
+        }
+
+        if (isAuthError(error)) {
+          onLogout();
+          return;
+        }
+
+        setHistoryOrdersStatus('error');
+        setHistoryOrdersError(error.message);
+      }
+    };
+
+    const loadHistorySummary = async () => {
+      setHistorySummaryStatus('loading');
+      setHistorySummaryError('');
+
+      try {
+        const data = await apiRequest(`/api/admin/orders/history/summary${queryString}`, { token: adminToken });
+
+        if (!isMounted) {
+          return;
+        }
+
+        setHistorySummary(data || null);
+        setHistorySummaryStatus('ready');
+      } catch (error) {
+        if (!isMounted) {
+          return;
+        }
+
+        if (isAuthError(error)) {
+          onLogout();
+          return;
+        }
+
+        setHistorySummaryStatus('error');
+        setHistorySummaryError(error.message);
+      }
+    };
+
+    loadHistoryOrders();
+    loadHistorySummary();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [activeTab, adminToken, historyFilters, historyReloadKey, onLogout]);
+
   const updateStatus = (orderId, newStatus) => {
     setOrdersActionError('');
     socket.emit('update_order_status', { order_id: orderId, status: newStatus, token: adminToken });
   };
 
-  const closeTable = async (tableId) => {
-    setClosingTableId(tableId);
+  const updatePaymentMethodDraft = (orderId, paymentMethod) => {
+    setPaymentMethodDrafts((current) => ({
+      ...current,
+      [orderId]: paymentMethod,
+    }));
+  };
+
+  const recordPayment = async (order) => {
+    const selectedPaymentMethod = paymentMethodDrafts[order.id] || 'cash';
+
+    setPayingTableId(order.table_id);
     setOrdersActionError('');
 
     try {
-      const closedOrder = await apiRequest(`/api/tables/${tableId}/close`, {
+      const closedOrder = await apiRequest(`/api/tables/${order.table_id}/payment`, {
         method: 'POST',
         token: adminToken,
+        body: {
+          payment_method: selectedPaymentMethod,
+        },
       });
 
       setOrders((previous) => previous.map((order) => (
@@ -1062,7 +1201,7 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
 
       setOrdersActionError(error.message);
     } finally {
-      setClosingTableId(null);
+      setPayingTableId(null);
     }
   };
 
@@ -1273,6 +1412,42 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
     setActiveTab('venue_settings');
     setSettingsFeedback('');
     setSettingsFeedbackType('success');
+  };
+
+  const openHistory = () => {
+    setActiveTab('history');
+  };
+
+  const updateHistoryDraftField = (field, value) => {
+    setHistoryFiltersDraft((current) => ({
+      ...current,
+      [field]: value,
+    }));
+  };
+
+  const applyHistoryPreset = (preset) => {
+    const nextFilters = {
+      ...DEFAULT_HISTORY_FILTERS,
+      preset,
+    };
+
+    setHistoryFiltersDraft(nextFilters);
+    setHistoryFilters(nextFilters);
+    setHistoryExpandedOrderId(null);
+  };
+
+  const applyHistoryFilters = () => {
+    setHistoryFilters({
+      ...historyFiltersDraft,
+      offset: 0,
+    });
+    setHistoryExpandedOrderId(null);
+  };
+
+  const clearHistoryFilters = () => {
+    setHistoryFiltersDraft({ ...DEFAULT_HISTORY_FILTERS });
+    setHistoryFilters({ ...DEFAULT_HISTORY_FILTERS });
+    setHistoryExpandedOrderId(null);
   };
 
   const openAddTableModal = () => {
@@ -1933,6 +2108,15 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
   const discardedReviewLines = (parsedMenu?.discardedLines || []).filter((line) => !suspiciousLineIds.has(reviewLineIdentity(line)));
   const isManualDraft = parsedMenu?.draftSource === 'manual';
   const isLight = theme === 'light';
+  const historySummaryMetrics = historySummary?.summary || {
+    orders_count: 0,
+    total_revenue: 0,
+    average_ticket: 0,
+    average_prep_minutes: null,
+    average_service_minutes: null,
+    average_to_payment_minutes: null,
+  };
+  const historyPaymentBreakdown = Array.isArray(historySummary?.payment_breakdown) ? historySummary.payment_breakdown : [];
 
   const renderReviewLineCard = (line, index, sourceLabel) => {
     const lineKey = reviewLineIdentity(line);
@@ -2094,11 +2278,17 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
     );
   };
 
-  const renderOrderCard = (order) => (
+  const renderOrderCard = (order) => {
+    const selectedPaymentMethod = paymentMethodDrafts[order.id] || order.payment_method || 'cash';
+
+    return (
     <div className={`order-card ${order.status === 'delivered' ? 'is-delivered' : ''}`} key={order.id}>
       <div className="order-header">
         <span className={`admin-badge ${getTableBadgeClass(order.table_id)}`}>Mesa {order.table_id}</span>
-        <span className="time">Entró {formatOrderTime(order.created_at)}</span>
+        <div className="table-request-card-meta-row">
+          <span className="time">Entró {formatOrderTime(order.created_at)}</span>
+          <span className="admin-badge is-info">{formatMenuMoney(order.total_amount)}</span>
+        </div>
       </div>
       <div className="order-timeline">
         <span className="order-timeline-item">
@@ -2125,8 +2315,14 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
         )}
         {order.bill_attended_at && (
           <span className="order-timeline-item">
-            <strong>Cuenta atendida</strong>
+            <strong>Cuenta entregada</strong>
             <span>{formatOrderTime(order.bill_attended_at)}</span>
+          </span>
+        )}
+        {order.payment_received_at && (
+          <span className="order-timeline-item">
+            <strong>Pago</strong>
+            <span>{formatOrderTime(order.payment_received_at)}</span>
           </span>
         )}
         {order.ready_at && (
@@ -2137,7 +2333,7 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
         )}
         {order.delivered_at && (
           <span className="order-timeline-item is-summary">
-            <strong>Total</strong>
+            <strong>Servicio</strong>
             <span>{formatDurationMinutes(order.created_at, order.delivered_at)}</span>
           </span>
         )}
@@ -2156,7 +2352,13 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
             <span className="admin-badge is-danger">Cuenta pedida</span>
           )}
           {order.bill_attended_at && (
-            <span className="admin-badge is-success">Cuenta atendida</span>
+            <span className="admin-badge is-success">Cuenta entregada</span>
+          )}
+          {order.payment_received_at && (
+            <span className="admin-badge is-success">Pago recibido</span>
+          )}
+          {order.payment_method && (
+            <span className="admin-badge is-info">{formatPaymentMethodLabel(order.payment_method)}</span>
           )}
         </div>
       </div>
@@ -2189,17 +2391,109 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
           </button>
         )}
         {order.status === 'delivered' && (
-          <button
-            className="btn admin-outline-action is-success"
-            onClick={() => closeTable(order.table_id)}
-            disabled={closingTableId === order.table_id || socketStatus !== 'connected' || !order.bill_attended_at}
-          >
-            <Check size={16} /> {closingTableId === order.table_id ? 'Cerrando...' : 'Cerrar mesa'}
-          </button>
+          <>
+            {!order.bill_attended_at && order.bill_requested_at && (
+              <div className="order-economic-note">
+                La cuenta todavía no fue entregada. Marcala desde Solicitudes de salón.
+              </div>
+            )}
+            {order.bill_attended_at && !order.payment_received_at && (
+              <div className="order-economic-controls">
+                <label className="order-payment-field">
+                  <span>Medio de pago</span>
+                  <select
+                    value={selectedPaymentMethod}
+                    onChange={(event) => updatePaymentMethodDraft(order.id, event.target.value)}
+                    disabled={payingTableId === order.table_id || socketStatus !== 'connected'}
+                  >
+                    {PAYMENT_METHOD_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  className="btn admin-outline-action is-success"
+                  onClick={() => recordPayment(order)}
+                  disabled={payingTableId === order.table_id || socketStatus !== 'connected'}
+                >
+                  <Check size={16} /> {payingTableId === order.table_id ? 'Registrando...' : 'Marcar cobrada'}
+                </button>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>
-  );
+    );
+  };
+
+  const renderHistoryOrderCard = (order) => {
+    const isExpanded = historyExpandedOrderId === order.id;
+
+    return (
+      <div className="glass-panel history-order-card" key={`history-${order.id}`}>
+        <div className="history-order-head">
+          <div>
+            <span className={`admin-badge ${getTableBadgeClass(order.table_id)}`}>Mesa {order.table_id}</span>
+            <h3>Pedido #{order.id}</h3>
+            <span className="history-order-meta">
+              Cerrado {formatOrderDateTime(order.closed_at)}
+            </span>
+          </div>
+          <div className="history-order-summary">
+            <span className="admin-badge is-info">{formatMenuMoney(order.total_amount)}</span>
+            <span className="admin-badge is-success">{formatHistoryPaymentMethod(order.payment_method)}</span>
+          </div>
+        </div>
+
+        <div className="history-order-metrics">
+          <span className="history-metric-chip">
+            Preparación: <strong>{formatHistoryMinutes(order?.durations?.prep_minutes)}</strong>
+          </span>
+          <span className="history-metric-chip">
+            Servicio: <strong>{formatHistoryMinutes(order?.durations?.service_minutes)}</strong>
+          </span>
+          <span className="history-metric-chip">
+            Cobro: <strong>{formatHistoryMinutes(order?.durations?.to_payment_minutes)}</strong>
+          </span>
+        </div>
+
+        <div className="history-order-actions">
+          <button
+            className="btn"
+            type="button"
+            onClick={() => setHistoryExpandedOrderId((current) => (current === order.id ? null : order.id))}
+          >
+            {isExpanded ? 'Ocultar detalle' : 'Ver detalle'}
+          </button>
+        </div>
+
+        {isExpanded && (
+          <div className="history-order-detail">
+            <div className="history-order-timeline">
+              <span><strong>Entró:</strong> {formatOrderDateTime(order.created_at) || '—'}</span>
+              <span><strong>Listo:</strong> {formatOrderDateTime(order.ready_at) || '—'}</span>
+              <span><strong>Entregado:</strong> {formatOrderDateTime(order.delivered_at) || '—'}</span>
+              <span><strong>Cuenta pedida:</strong> {formatOrderDateTime(order.bill_requested_at) || '—'}</span>
+              <span><strong>Cuenta entregada:</strong> {formatOrderDateTime(order.bill_attended_at) || '—'}</span>
+              <span><strong>Pago recibido:</strong> {formatOrderDateTime(order.payment_received_at) || '—'}</span>
+            </div>
+            <ul className="order-items-list">
+              {(order.items || []).map((item, index) => (
+                <li key={`history-item-${order.id}-${item.item_id}-${index}`}>
+                  <span className="item-qty">{item.quantity}x</span> {item.name}
+                  <span className="history-item-price">{formatMenuMoney(item.price * item.quantity)}</span>
+                  {item.comments && <span className="item-comment">"{item.comments}"</span>}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    );
+  };
 
   const renderTableRequestCard = (request) => (
     <div
@@ -2228,7 +2522,9 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
       <p>
         {request.status === 'pending'
           ? TABLE_REQUEST_TYPE_CONFIG[request.type]?.helper || 'La mesa está esperando una acción del salón.'
-          : 'Ya fue atendida por el equipo.'}
+          : request.type === 'request_bill'
+            ? 'La cuenta ya fue entregada.'
+            : 'Ya fue atendida por el equipo.'}
       </p>
       <div className="table-request-card-meta">
         <span>Entró {new Date(request.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
@@ -2242,7 +2538,11 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
           onClick={() => resolvePendingTableRequest(request.id)}
           disabled={resolvingRequestId === request.id || socketStatus !== 'connected'}
         >
-          <Check size={16} /> {resolvingRequestId === request.id ? 'Marcando...' : 'Marcar resuelta'}
+          <Check size={16} /> {resolvingRequestId === request.id
+            ? 'Marcando...'
+            : request.type === 'request_bill'
+              ? 'Cuenta entregada'
+              : 'Marcar resuelta'}
         </button>
       )}
     </div>
@@ -2295,6 +2595,13 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
           Importar Menú (Foto)
         </button>
         <button
+          className={`btn ${activeTab === 'history' ? 'btn-primary' : ''}`}
+          type="button"
+          onClick={openHistory}
+        >
+          Historial
+        </button>
+        <button
           className={`btn ${activeTab === 'venue_settings' ? 'btn-primary' : ''}`}
           type="button"
           onClick={openVenueSettings}
@@ -2306,9 +2613,6 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
       {activeTab === 'kanban' && (
         <>
           <div className="admin-toolbar">
-            <button className="btn btn-primary admin-import-button" type="button" onClick={focusImportFlow}>
-              <Upload size={16} /> Importar menú
-            </button>
             <button className="btn" type="button" onClick={openAddTableModal}>
               <Plus size={16} /> Agregar mesa
             </button>
@@ -2450,8 +2754,8 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
               <div className="delivered-history-panel glass-panel">
                 <div className="delivered-history-head">
                   <div>
-                    <span className="admin-pill">Historial</span>
-                    <h3>Pedidos entregados</h3>
+                    <span className="admin-pill">Entregados</span>
+                    <h3>Pedidos entregados pendientes de cobro</h3>
                   </div>
                   <button
                     className="btn"
@@ -2471,6 +2775,169 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
             </>
           )}
         </>
+      )}
+
+      {activeTab === 'history' && (
+        <section className="history-tab-shell">
+          <div className="glass-panel history-filters-panel">
+            <div className="history-filters-head">
+              <div>
+                <h2 className="admin-section-title">Historial operativo</h2>
+                <p className="admin-section-copy">
+                  Solo muestra pedidos cobrados y cerrados. El período se calcula por fecha de cierre.
+                </p>
+              </div>
+            </div>
+
+            <div className="history-preset-row">
+              {HISTORY_PRESET_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  className={`btn ${!historyFiltersDraft.from && !historyFiltersDraft.to && historyFiltersDraft.preset === option.value ? 'btn-primary' : ''}`}
+                  type="button"
+                  onClick={() => applyHistoryPreset(option.value)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="history-filters-grid">
+              <label className="settings-field">
+                <span>Desde</span>
+                <input
+                  className="admin-input admin-input--compact"
+                  type="date"
+                  value={historyFiltersDraft.from}
+                  onChange={(event) => updateHistoryDraftField('from', event.target.value)}
+                />
+              </label>
+              <label className="settings-field">
+                <span>Hasta</span>
+                <input
+                  className="admin-input admin-input--compact"
+                  type="date"
+                  value={historyFiltersDraft.to}
+                  onChange={(event) => updateHistoryDraftField('to', event.target.value)}
+                />
+              </label>
+              <label className="settings-field">
+                <span>Medio de pago</span>
+                <select
+                  className="admin-input admin-input--compact"
+                  value={historyFiltersDraft.payment_method}
+                  onChange={(event) => updateHistoryDraftField('payment_method', event.target.value)}
+                >
+                  {HISTORY_PAYMENT_METHOD_OPTIONS.map((option) => (
+                    <option key={option.value || 'all'} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <div className="history-filter-actions">
+                <button className="btn btn-primary" type="button" onClick={applyHistoryFilters}>
+                  Aplicar
+                </button>
+                <button className="btn" type="button" onClick={clearHistoryFilters}>
+                  Limpiar
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {historySummaryStatus === 'error' && (
+            <div className="admin-alert is-error">
+              <strong className="admin-alert-title">No pudimos cargar el resumen.</strong>
+              <span className="admin-alert-copy">{historySummaryError}</span>
+            </div>
+          )}
+
+          {historySummaryStatus === 'ready' && (
+            <div className="history-summary-grid">
+              <div className="glass-panel history-summary-card">
+                <span className="admin-pill">Pedidos</span>
+                <strong>{historySummaryMetrics.orders_count}</strong>
+                <span>Cobrados en el período</span>
+              </div>
+              <div className="glass-panel history-summary-card">
+                <span className="admin-pill">Total cobrado</span>
+                <strong>{formatMenuMoney(historySummaryMetrics.total_revenue)}</strong>
+                <span>Ingresos cerrados</span>
+              </div>
+              <div className="glass-panel history-summary-card">
+                <span className="admin-pill">Ticket promedio</span>
+                <strong>{formatMenuMoney(historySummaryMetrics.average_ticket)}</strong>
+                <span>Promedio por pedido</span>
+              </div>
+              <div className="glass-panel history-summary-card">
+                <span className="admin-pill">Prep. promedio</span>
+                <strong>{formatHistoryMinutes(historySummaryMetrics.average_prep_minutes)}</strong>
+                <span>Hasta listo</span>
+              </div>
+              <div className="glass-panel history-summary-card">
+                <span className="admin-pill">Servicio promedio</span>
+                <strong>{formatHistoryMinutes(historySummaryMetrics.average_service_minutes)}</strong>
+                <span>Hasta entregado</span>
+              </div>
+              <div className="glass-panel history-summary-card">
+                <span className="admin-pill">Cobro promedio</span>
+                <strong>{formatHistoryMinutes(historySummaryMetrics.average_to_payment_minutes)}</strong>
+                <span>Hasta pago registrado</span>
+              </div>
+            </div>
+          )}
+
+          {historySummaryStatus === 'ready' && (
+            <div className="glass-panel history-breakdown-panel">
+              <div className="history-breakdown-head">
+                <div>
+                  <span className="admin-pill">Medios de pago</span>
+                  <h3>Desglose simple del período</h3>
+                </div>
+              </div>
+              {historyPaymentBreakdown.length > 0 ? (
+                <div className="history-breakdown-list">
+                  {historyPaymentBreakdown.map((entry) => (
+                    <div className="history-breakdown-item" key={`breakdown-${entry.payment_method}`}>
+                      <strong>{formatHistoryPaymentMethod(entry.payment_method)}</strong>
+                      <span>{entry.orders_count} pedido(s)</span>
+                      <span>{formatMenuMoney(entry.total_revenue)}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="order-empty-state">
+                  <Receipt size={20} />
+                  <div>
+                    <strong>Sin cobros en el período.</strong>
+                    <span>Cuando cierres mesas cobradas, van a aparecer acá.</span>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {historyOrdersStatus === 'loading' && <div className="loader"></div>}
+
+          {historyOrdersStatus === 'error' && (
+            <div className="admin-alert is-error">
+              <strong className="admin-alert-title">No pudimos cargar el historial.</strong>
+              <span className="admin-alert-copy">{historyOrdersError}</span>
+            </div>
+          )}
+
+          {historyOrdersStatus === 'empty' && (
+            <div className="glass-panel admin-empty-state">
+              <h2>No hay pedidos cobrados para ese filtro.</h2>
+              <p>Probá otro rango o esperá a que haya mesas cerradas en el período seleccionado.</p>
+            </div>
+          )}
+
+          {historyOrdersStatus === 'ready' && (
+            <div className="history-orders-list">
+              {historyOrders.map(renderHistoryOrderCard)}
+            </div>
+          )}
+        </section>
       )}
 
       {activeTab === 'menu_import' && (

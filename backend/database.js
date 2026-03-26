@@ -1,16 +1,38 @@
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 const dotenv = require('dotenv');
 const sqlite3 = require('sqlite3').verbose();
 const { runMigrations } = require('./lib/migrations');
 
 dotenv.config({ path: path.join(__dirname, '.env') });
 
-const dbPath = path.resolve(process.env.DB_PATH || process.env.DATABASE_PATH || path.join(__dirname, 'database.sqlite'));
+function resolveDatabasePath() {
+  const configuredPath = process.env.DB_PATH || process.env.DATABASE_PATH;
+
+  if (configuredPath) {
+    return path.isAbsolute(configuredPath)
+      ? configuredPath
+      : path.resolve(__dirname, configuredPath);
+  }
+
+  return path.join(os.homedir(), '.mozzo', 'data', 'database.sqlite');
+}
+
+const dbPath = resolveDatabasePath();
+fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+
+const legacyRepoDbPath = path.join(__dirname, 'database.sqlite');
+if (!process.env.DB_PATH && !process.env.DATABASE_PATH && !fs.existsSync(dbPath) && fs.existsSync(legacyRepoDbPath)) {
+  fs.copyFileSync(legacyRepoDbPath, dbPath);
+  console.log(`Copied legacy SQLite database to ${dbPath}.`);
+}
+
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
     console.error('Error opening database', err.message);
   } else {
-    console.log('Connected to SQLite database.');
+    console.log(`Connected to SQLite database at ${dbPath}.`);
   }
 });
 

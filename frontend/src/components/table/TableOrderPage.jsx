@@ -6,6 +6,7 @@ export default function TableOrderPage() {
   const {
     tableId,
     activeOrder,
+    activeOrderTotal,
     activeOrderStatus,
     activeOrderError,
     menuAvailabilityFeedback,
@@ -94,7 +95,7 @@ export default function TableOrderPage() {
                 <span className="table-badge">Cuenta pedida</span>
               )}
               {activeOrder.bill_attended_at && (
-                <span className="table-badge">Cuenta atendida</span>
+                <span className="table-badge">Cuenta entregada</span>
               )}
             </div>
           </div>
@@ -109,6 +110,10 @@ export default function TableOrderPage() {
                 </div>
               </div>
             ))}
+          </div>
+
+          <div className="cart-footer">
+            <div className="grand-total">Total enviado: {formatMoney(activeOrderTotal)}</div>
           </div>
         </section>
       )}

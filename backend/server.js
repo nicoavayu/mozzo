@@ -22,10 +22,13 @@ const {
     clearBillRequestedForTable,
     closeOpenOrderForTable,
     getActiveOrderForTable,
+    getClosedOrdersHistorySummary,
     getOrderSessionForTable,
+    listClosedOrdersHistory,
     listOrders,
     markBillAttendedForTable,
     markBillRequestedForTable,
+    markPaymentReceivedForTable,
     updateOrderStatus
 } = require('./lib/orders');
 const {
@@ -528,6 +531,24 @@ app.post('/api/orders', async (req, res) => {
     }
 });
 
+app.get('/api/admin/orders/history', requireAdmin, async (req, res) => {
+    try {
+        const history = await listClosedOrdersHistory(database, req.query || {});
+        res.json(history);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.get('/api/admin/orders/history/summary', requireAdmin, async (req, res) => {
+    try {
+        const summary = await getClosedOrdersHistorySummary(database, req.query || {});
+        res.json(summary);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
 // 3. Get all orders (for admin initial load)
 app.get('/api/orders', requireAdmin, async (req, res) => {
     try {
@@ -570,6 +591,26 @@ app.post('/api/tables/:id/close', requireAdmin, async (req, res) => {
     try {
         const { order, resolvedRequests } = await database.withTransaction(async () => {
             const nextOrder = await closeOpenOrderForTable(database, req.params.id);
+            const nextResolvedRequests = await resolvePendingTableRequestsForTable(database, req.params.id);
+            return { order: nextOrder, resolvedRequests: nextResolvedRequests };
+        });
+
+        resolvedRequests.forEach(emitTableRequestUpdated);
+        emitOrderUpdated(order);
+        res.json(order);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.post('/api/tables/:id/payment', requireAdmin, async (req, res) => {
+    try {
+        const { order, resolvedRequests } = await database.withTransaction(async () => {
+            const nextOrder = await markPaymentReceivedForTable(
+                database,
+                req.params.id,
+                req.body?.payment_method
+            );
             const nextResolvedRequests = await resolvePendingTableRequestsForTable(database, req.params.id);
             return { order: nextOrder, resolvedRequests: nextResolvedRequests };
         });
