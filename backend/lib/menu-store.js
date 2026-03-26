@@ -31,6 +31,87 @@ function normalizeAvailability(value) {
   throw createMenuStoreError('INVALID_AVAILABILITY', 'is_available must be a boolean');
 }
 
+function hasMenuPrice(value) {
+  if (value === null || value === undefined) {
+    return false;
+  }
+
+  if (typeof value === 'string' && value.trim() === '') {
+    return false;
+  }
+
+  return true;
+}
+
+function validatePublishableCategories(categories) {
+  const safeCategories = Array.isArray(categories) ? categories : [];
+  const normalizedCategories = [];
+
+  for (const category of safeCategories) {
+    const normalizedCategory = {
+      name: String(category?.name || '').trim() || 'Categoría',
+      items: [],
+    };
+
+    for (const item of category?.items || []) {
+      const name = String(item?.name || '').trim();
+      const description = String(item?.description || '').trim();
+      const rawPrice = item?.price;
+      const hasPrice = hasMenuPrice(rawPrice);
+      const hasAnyContent = Boolean(name || description || hasPrice);
+
+      if (!hasAnyContent) {
+        continue;
+      }
+
+      if (!name) {
+        throw createMenuStoreError(
+          'INVALID_MENU_ITEM',
+          'Cada plato debe tener nombre o eliminarse antes de publicar.',
+          400
+        );
+      }
+
+      if (!hasPrice) {
+        throw createMenuStoreError(
+          'INVALID_MENU_PRICE',
+          `El plato "${name}" necesita un precio antes de publicar.`,
+          400
+        );
+      }
+
+      const numericPrice = Number(rawPrice);
+      if (!Number.isFinite(numericPrice) || numericPrice < 0) {
+        throw createMenuStoreError(
+          'INVALID_MENU_PRICE',
+          `El precio de "${name}" no es válido.`,
+          400
+        );
+      }
+
+      normalizedCategory.items.push({
+        name,
+        description,
+        price: numericPrice,
+      });
+    }
+
+    if (normalizedCategory.items.length > 0) {
+      normalizedCategories.push(normalizedCategory);
+    }
+  }
+
+  if (normalizedCategories.length === 0) {
+    throw createMenuStoreError(
+      'EMPTY_MENU_PUBLISH',
+      'El borrador no tiene categorías con platos válidos para publicar.',
+      400
+    );
+  }
+
+  return normalizedCategories;
+}
+
 async function getActiveMenuCategories(database) {
   const activeMenu = await database.get(
     'SELECT id FROM menus WHERE is_active = 1 ORDER BY published_at DESC, id DESC LIMIT 1'
@@ -97,7 +178,7 @@ async function getActiveMenuSummary(database) {
 }
 
 async function publishMenuVersion(database, categories, name = null) {
-  const safeCategories = Array.isArray(categories) ? categories : [];
+  const safeCategories = validatePublishableCategories(categories);
   const menuName = name || `Published Menu ${new Date().toISOString()}`;
 
   return database.withTransaction(async () => {
@@ -127,7 +208,7 @@ async function publishMenuVersion(database, categories, name = null) {
             categoryResult.lastID,
             item.name,
             item.description || '',
-            item.price || 0
+            item.price
           ]
         );
       }
@@ -202,4 +283,5 @@ module.exports = {
   publishMenuVersion,
   clearActiveMenu,
   updateActiveMenuItemAvailability,
+  validatePublishableCategories,
 };

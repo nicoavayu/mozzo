@@ -2,6 +2,7 @@ import { Bell, ClipboardList, MessageSquareText, Receipt, Sparkles, Star, X } fr
 import { useState } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import { formatMoney } from '../../hooks/useTableSession';
+import { getVisibleVenueLinks } from '../../lib/venueSettings';
 import DashboardActionCard from './DashboardActionCard';
 
 export default function TableDashboardPage() {
@@ -22,7 +23,6 @@ export default function TableDashboardPage() {
     cancelTableRequest,
     tableRequestFeedback,
     tableRequestActionError,
-    venueLinks,
     venueSettings,
     clearTableRequestMessages,
     reloadSession,
@@ -46,8 +46,20 @@ export default function TableDashboardPage() {
     : tableRequestFeedback.toLowerCase().includes('cancel')
       ? 'Solicitud cancelada.'
       : 'Solicitud enviada.';
+  const guestFeedbackLinks = getVisibleVenueLinks(venueSettings).reduce((nextLinks, link) => {
+    if (link.key === 'review') {
+      nextLinks.reviewUrl = link.url;
+    }
+
+    if (link.key === 'feedback') {
+      nextLinks.feedbackUrl = link.url;
+    }
+
+    return nextLinks;
+  }, { feedbackUrl: '', reviewUrl: '' });
+  const canCancelBillRequest = isBillRequested && !isBillAttended;
   const showGuestFeedbackActions = isBillRequested;
-  const hasGuestFeedbackLinks = Boolean(venueLinks.feedbackUrl || venueLinks.reviewUrl);
+  const hasGuestFeedbackLinks = Boolean(guestFeedbackLinks.feedbackUrl || guestFeedbackLinks.reviewUrl);
 
   const handleWaiterAction = () => {
     if (isWaiterRequested) {
@@ -59,7 +71,7 @@ export default function TableDashboardPage() {
   };
 
   const handleBillAction = () => {
-    if (isBillRequested) {
+    if (canCancelBillRequest) {
       cancelTableRequest('request_bill');
       return;
     }
@@ -125,14 +137,16 @@ export default function TableDashboardPage() {
         <DashboardActionCard
           icon={Receipt}
           title="Pedir la cuenta"
-          subtitle={isBillAttended ? 'Cuenta entregada' : isBillRequested ? 'Cuenta pedida' : ''}
+          subtitle={isBillAttended ? 'Cuenta entregada' : canCancelBillRequest ? 'Tocá para cancelar el pedido' : isBillRequested ? 'Cuenta pedida' : ''}
           hint={
-            !canRequestBill && !isBillRequested
+            !canRequestBill && !canCancelBillRequest
               ? 'Necesitás un pedido enviado'
+              : canCancelBillRequest
+                ? 'Podés cancelarlo si fue un error y todavía no lo atendieron.'
               : ''
           }
           badge={isBillAttended ? 'Entregada' : isBillRequested ? 'Solicitada' : ''}
-          disabled={!canRequestBill || Boolean(submittingRequestType) || isBillRequested}
+          disabled={Boolean(submittingRequestType) || isBillAttended || (!canRequestBill && !canCancelBillRequest)}
           onClick={handleBillAction}
         />
       </section>
@@ -172,10 +186,10 @@ export default function TableDashboardPage() {
             <span>Si querés, podés dejarnos un comentario o una reseña sobre tu experiencia.</span>
           </div>
           <div className="dashboard-feedback-actions">
-            {venueLinks.feedbackUrl ? (
+            {guestFeedbackLinks.feedbackUrl ? (
               <a
                 className="btn"
-                href={venueLinks.feedbackUrl}
+                href={guestFeedbackLinks.feedbackUrl}
                 target="_blank"
                 rel="noreferrer"
               >
@@ -188,10 +202,10 @@ export default function TableDashboardPage() {
                 Comentarios y sugerencias
               </button>
             )}
-            {venueLinks.reviewUrl ? (
+            {guestFeedbackLinks.reviewUrl ? (
               <a
                 className="btn btn-primary"
-                href={venueLinks.reviewUrl}
+                href={guestFeedbackLinks.reviewUrl}
                 target="_blank"
                 rel="noreferrer"
               >

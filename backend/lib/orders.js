@@ -338,6 +338,11 @@ async function listOrders(database) {
   return mapOrderRows(rows);
 }
 
+async function listOpenOrders(database) {
+  const rows = await getOrderRows(database, 'WHERE o.closed_at IS NULL');
+  return mapOrderRows(rows);
+}
+
 async function listClosedOrdersHistory(database, rawFilters = {}) {
   const filters = normalizeHistoryFilters(rawFilters);
   const { whereClause, params } = buildHistoryWhereClause(filters);
@@ -840,6 +845,7 @@ module.exports = {
   getOrderSessionForTable,
   getOrderById,
   listClosedOrdersHistory,
+  listOpenOrders,
   listOrders,
   markBillAttendedForTable,
   markBillRequestedForTable,

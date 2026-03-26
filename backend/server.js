@@ -19,12 +19,14 @@ const {
 const { extractStructuredMenuOcr } = require('./lib/menu-import');
 const {
     createOrder,
+    createOrderError,
     clearBillRequestedForTable,
     closeOpenOrderForTable,
     getActiveOrderForTable,
     getClosedOrdersHistorySummary,
     getOrderSessionForTable,
     listClosedOrdersHistory,
+    listOpenOrders,
     listOrders,
     markBillAttendedForTable,
     markBillRequestedForTable,
@@ -363,7 +365,10 @@ app.post('/api/menu/publish', requireAdmin, async (req, res) => {
         res.json({ success: true, menu_id: menuId });
     } catch (err) {
         console.error('Menu publish failed', err);
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({
+            error: err.message,
+            code: err.code || 'UNKNOWN'
+        });
     }
 });
 
@@ -504,18 +509,50 @@ app.delete('/api/tables/:id/call-waiter', async (req, res) => {
 app.delete('/api/tables/:id/request-bill', async (req, res) => {
     try {
         const { tableRequest, order } = await database.withTransaction(async () => {
-            const nextTableRequest = await cancelTableRequestForTable(database, {
-                table_id: req.params.id,
-                type: 'request_bill'
-            });
+            const currentOrder = await getActiveOrderForTable(database, req.params.id);
+
+            if (!currentOrder) {
+                throw createOrderError('NO_OPEN_ORDER', 'No hay un pedido abierto para esta mesa.', 404);
+            }
+
+            if (currentOrder.bill_attended_at) {
+                throw createOrderError(
+                    'BILL_ALREADY_ATTENDED',
+                    'La cuenta ya fue entregada y no se puede cancelar.',
+                    409
+                );
+            }
+
+            let nextTableRequest = null;
+
+            try {
+                nextTableRequest = await cancelTableRequestForTable(database, {
+                    table_id: req.params.id,
+                    type: 'request_bill'
+                });
+            } catch (error) {
+                if (error.code !== 'TABLE_REQUEST_NOT_FOUND') {
+                    throw error;
+                }
+            }
+
             const nextOrder = await clearBillRequestedForTable(database, req.params.id);
 
             return { tableRequest: nextTableRequest, order: nextOrder };
         });
 
         emitOrderUpdated(order);
-        emitTableRequestUpdated(tableRequest);
-        res.json(tableRequest);
+        if (tableRequest) {
+            emitTableRequestUpdated(tableRequest);
+        }
+        res.json(tableRequest || {
+            id: null,
+            table_id: Number(req.params.id),
+            type: 'request_bill',
+            status: 'resolved',
+            resolved_at: new Date().toISOString(),
+            already_resolved: true
+        });
     } catch (error) {
         sendOrderHttpError(res, error);
     }
@@ -544,6 +581,15 @@ app.get('/api/admin/orders/history/summary', requireAdmin, async (req, res) => {
     try {
         const summary = await getClosedOrdersHistorySummary(database, req.query || {});
         res.json(summary);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.get('/api/admin/orders/open', requireAdmin, async (req, res) => {
+    try {
+        const orders = await listOpenOrders(database);
+        res.json(orders);
     } catch (error) {
         sendOrderHttpError(res, error);
     }

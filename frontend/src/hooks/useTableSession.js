@@ -133,7 +133,6 @@ export default function useTableSession(tableId, socket) {
   const [tableRequestFeedback, setTableRequestFeedback] = useState('');
   const [tableRequestActionError, setTableRequestActionError] = useState('');
   const [submittingRequestType, setSubmittingRequestType] = useState('');
-  const [venueLinks, setVenueLinks] = useState({ feedbackUrl: '', reviewUrl: '' });
   const [reloadKey, setReloadKey] = useState(0);
   const socketStatus = useSocketStatus(socket);
   const orderConfirmedTimeoutRef = useRef(null);
@@ -178,7 +177,6 @@ export default function useTableSession(tableId, socket) {
     setTableRequestFeedback('');
     setTableRequestActionError('');
     setSubmittingRequestType('');
-    setVenueLinks({ feedbackUrl: '', reviewUrl: '' });
   }, [tableId]);
 
   useEffect(() => {
@@ -362,27 +360,6 @@ export default function useTableSession(tableId, socket) {
       }
     };
 
-    const fetchVenueLinks = async () => {
-      try {
-        const data = await apiRequest('/api/guest-links');
-
-        if (!isMounted) {
-          return;
-        }
-
-        setVenueLinks({
-          feedbackUrl: data?.feedback_url || '',
-          reviewUrl: data?.review_url || '',
-        });
-      } catch {
-        if (!isMounted) {
-          return;
-        }
-
-        setVenueLinks({ feedbackUrl: '', reviewUrl: '' });
-      }
-    };
-
     const joinTableRoom = () => {
       socket.emit('join_table', { table_id: numericTableId }, (response) => {
         if (!isMounted || response?.success !== false) {
@@ -418,7 +395,6 @@ export default function useTableSession(tableId, socket) {
       fetchMenu({ showLoader: false });
       fetchOrderSession({ showLoader: false });
       fetchTableRequests({ showLoader: false });
-      fetchVenueLinks();
     };
 
     const handleMenuUpdated = () => {
@@ -487,7 +463,6 @@ export default function useTableSession(tableId, socket) {
     fetchMenu();
     fetchOrderSession();
     fetchTableRequests();
-    fetchVenueLinks();
 
     socket.on('menu_updated', handleMenuUpdated);
     socket.on('order_confirmed', handleOrderConfirmed);
@@ -673,8 +648,10 @@ export default function useTableSession(tableId, socket) {
       });
 
       setTableRequests((previous) => {
-        const nextRequests = upsertTableRequest(previous, tableRequest)
-          .filter((entry) => entry.status === 'pending');
+        const nextRequests = requestType === 'request_bill'
+          ? previous.filter((entry) => !(entry.type === 'request_bill' && entry.status === 'pending'))
+          : upsertTableRequest(previous, tableRequest)
+            .filter((entry) => entry.status === 'pending');
         setTableRequestsStatus(nextRequests.length > 0 ? 'ready' : 'empty');
         return nextRequests;
       });
@@ -740,7 +717,6 @@ export default function useTableSession(tableId, socket) {
     tableRequestFeedback,
     tableRequestActionError,
     submittingRequestType,
-    venueLinks,
     socketStatus,
     hasMenuItems,
     isDraftLocked,

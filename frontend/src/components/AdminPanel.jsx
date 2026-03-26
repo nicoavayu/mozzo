@@ -26,7 +26,7 @@ import {
   createEmptyItem,
   createManualMenuDraft,
   normalizeMenuDraft,
-  validateManualMenuDraft,
+  validatePublishableMenuDraft,
 } from '../lib/adminMenuDraft';
 import { useSocketStatus } from '../lib/useSocketStatus';
 
@@ -859,16 +859,15 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
       setOrdersError('');
 
       try {
-        const data = await apiRequest('/api/orders', { token: adminToken });
+        const data = await apiRequest('/api/admin/orders/open', { token: adminToken });
 
         if (!isMounted) {
           return;
         }
 
         const nextOrders = Array.isArray(data) ? data : [];
-        const nextOpenOrders = nextOrders.filter((order) => !order.closed_at);
         setOrders(nextOrders);
-        setOrdersStatus(nextOpenOrders.length > 0 ? 'ready' : 'empty');
+        setOrdersStatus(nextOrders.length > 0 ? 'ready' : 'empty');
       } catch (error) {
         if (!isMounted) {
           return;
@@ -1015,8 +1014,10 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
 
     const handleOrderUpdated = (order) => {
       setOrders((previous) => {
-        const nextOrders = [order, ...previous.filter((existingOrder) => existingOrder.id !== order.id)];
-        setOrdersStatus(nextOrders.some((entry) => !entry.closed_at) ? 'ready' : 'empty');
+        const nextOrders = order?.closed_at
+          ? previous.filter((existingOrder) => existingOrder.id !== order.id)
+          : [order, ...previous.filter((existingOrder) => existingOrder.id !== order.id)];
+        setOrdersStatus(nextOrders.length > 0 ? 'ready' : 'empty');
         return nextOrders;
       });
       setOrdersActionError('');
@@ -1190,9 +1191,12 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
         },
       });
 
-      setOrders((previous) => previous.map((order) => (
-        order.id === closedOrder.id ? closedOrder : order
-      )));
+      setOrders((previous) => {
+        const nextOrders = previous.filter((entry) => entry.id !== closedOrder.id);
+        setOrdersStatus(nextOrders.length > 0 ? 'ready' : 'empty');
+        return nextOrders;
+      });
+      setHistoryReloadKey((current) => current + 1);
     } catch (error) {
       if (isAuthError(error)) {
         onLogout();
@@ -1348,13 +1352,11 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
     setMenuActionSuccess('');
 
     try {
-      if (parsedMenu.draftSource === 'manual') {
-        const manualValidationError = validateManualMenuDraft(parsedMenu);
+      const publishValidationError = validatePublishableMenuDraft(parsedMenu);
 
-        if (manualValidationError) {
-          setMenuActionError(manualValidationError);
-          return;
-        }
+      if (publishValidationError) {
+        setMenuActionError(publishValidationError);
+        return;
       }
 
       const publishableCategories = buildPublishableCategories(parsedMenu.categories);

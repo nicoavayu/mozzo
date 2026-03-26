@@ -170,6 +170,24 @@ async function main() {
       assert.equal(fetched.body.restaurant_subtitle, payload.restaurant_subtitle);
       assert.equal(fetched.body.contact_url, payload.contact_url);
 
+      const invalidPublish = await requestJson(`${baseUrl}/api/menu/publish`, {
+        method: 'POST',
+        headers: authHeaders(adminToken, true),
+        body: JSON.stringify({
+          name: 'Smoke Menu inválido',
+          categories: [
+            {
+              name: 'Principales',
+              items: [
+                { name: 'Milanesa rota', description: 'Sin precio', price: '' },
+              ],
+            },
+          ],
+        }),
+      });
+      assert.equal(invalidPublish.response.status, 400);
+      assert.equal(invalidPublish.body.code, 'INVALID_MENU_PRICE');
+
       const publish = await requestJson(`${baseUrl}/api/menu/publish`, {
         method: 'POST',
         headers: authHeaders(adminToken, true),
@@ -227,12 +245,36 @@ async function main() {
       });
       assert.equal(requestBill.response.status, 201);
 
+      const sessionWithBillRequested = await requestJson(`${baseUrl}/api/tables/1/orders/session`);
+      assert.equal(sessionWithBillRequested.response.status, 200);
+      assert.ok(sessionWithBillRequested.body.active_order.bill_requested_at);
+
+      const cancelBill = await requestJson(`${baseUrl}/api/tables/1/request-bill`, {
+        method: 'DELETE',
+      });
+      assert.equal(cancelBill.response.status, 200);
+
+      const sessionAfterBillCancel = await requestJson(`${baseUrl}/api/tables/1/orders/session`);
+      assert.equal(sessionAfterBillCancel.response.status, 200);
+      assert.equal(sessionAfterBillCancel.body.active_order.bill_requested_at, null);
+
+      const secondRequestBill = await requestJson(`${baseUrl}/api/tables/1/request-bill`, {
+        method: 'POST',
+      });
+      assert.equal(secondRequestBill.response.status, 201);
+
+      const openOrdersBeforePayment = await requestJson(`${baseUrl}/api/admin/orders/open`, {
+        headers: authHeaders(adminToken),
+      });
+      assert.equal(openOrdersBeforePayment.response.status, 200);
+      assert.ok(openOrdersBeforePayment.body.some((order) => order.id === orderId));
+
       const resolveBillUpdate = waitForSocketEvent(
         adminSocket,
         'order_updated',
         (order) => order?.id === orderId && Boolean(order?.bill_attended_at)
       );
-      const resolveBill = await requestJson(`${baseUrl}/api/table-requests/${requestBill.body.id}/resolve`, {
+      const resolveBill = await requestJson(`${baseUrl}/api/table-requests/${secondRequestBill.body.id}/resolve`, {
         method: 'POST',
         headers: authHeaders(adminToken),
       });
@@ -254,6 +296,12 @@ async function main() {
       assert.equal(payment.body.payment_method, 'card');
       assert.ok(payment.body.closed_at);
       await paymentUpdate;
+
+      const openOrdersAfterPayment = await requestJson(`${baseUrl}/api/admin/orders/open`, {
+        headers: authHeaders(adminToken),
+      });
+      assert.equal(openOrdersAfterPayment.response.status, 200);
+      assert.ok(openOrdersAfterPayment.body.every((order) => order.id !== orderId));
 
       const session = await requestJson(`${baseUrl}/api/tables/1/orders/session`);
       assert.equal(session.response.status, 200);

@@ -65,26 +65,46 @@ export function createManualMenuDraft() {
   };
 }
 
+function hasDraftPrice(value) {
+  if (value === null || value === undefined) {
+    return false;
+  }
+
+  if (typeof value === 'string' && value.trim() === '') {
+    return false;
+  }
+
+  return true;
+}
+
 export function buildPublishableCategories(categories = []) {
   return categories
     .map((category) => ({
       name: String(category.name || '').trim() || 'Categoría',
       items: (category.items || [])
-        .map((item) => ({
-          name: String(item.name || '').trim(),
-          description: String(item.description || '').trim(),
-          price: item.price === '' || item.price === null || item.price === undefined
-            ? 0
-            : Number(item.price),
-        }))
-        .filter((item) => item.name),
+        .map((item) => {
+          const name = String(item.name || '').trim();
+          const description = String(item.description || '').trim();
+          const price = Number(item.price);
+
+          if (!name || !hasDraftPrice(item.price) || !Number.isFinite(price) || price < 0) {
+            return null;
+          }
+
+          return {
+            name,
+            description,
+            price,
+          };
+        })
+        .filter(Boolean),
     }))
     .filter((category) => category.items.length > 0);
 }
 
-export function validateManualMenuDraft(draft) {
+export function validatePublishableMenuDraft(draft, { emptyDraftMessage } = {}) {
   if (!draft) {
-    return 'No hay un borrador manual para publicar.';
+    return emptyDraftMessage || 'No hay un borrador para publicar.';
   }
 
   const menuName = String(draft.name || '').trim();
@@ -99,7 +119,7 @@ export function validateManualMenuDraft(draft) {
       const name = String(item?.name || '').trim();
       const description = String(item?.description || '').trim();
       const rawPrice = item?.price;
-      const hasPrice = rawPrice !== '' && rawPrice !== null && rawPrice !== undefined;
+      const hasPrice = hasDraftPrice(rawPrice);
       const hasAnyContent = Boolean(name || description || hasPrice);
 
       if (!hasAnyContent) {
@@ -107,7 +127,7 @@ export function validateManualMenuDraft(draft) {
       }
 
       if (!name) {
-        return 'Cada plato manual debe tener nombre o eliminarse antes de publicar.';
+        return 'Cada plato debe tener nombre o eliminarse antes de publicar.';
       }
 
       if (!hasPrice) {
@@ -122,8 +142,24 @@ export function validateManualMenuDraft(draft) {
   }
 
   if (buildPublishableCategories(categories).length === 0) {
-    return 'El borrador manual necesita al menos una categoría con platos válidos.';
+    return 'El borrador necesita al menos una categoría con platos válidos.';
   }
 
   return null;
+}
+
+export function validateManualMenuDraft(draft) {
+  const validationError = validatePublishableMenuDraft(draft, {
+    emptyDraftMessage: 'No hay un borrador manual para publicar.',
+  });
+
+  if (validationError === 'Cada plato debe tener nombre o eliminarse antes de publicar.') {
+    return 'Cada plato manual debe tener nombre o eliminarse antes de publicar.';
+  }
+
+  if (validationError === 'El borrador necesita al menos una categoría con platos válidos.') {
+    return 'El borrador manual necesita al menos una categoría con platos válidos.';
+  }
+
+  return validationError;
 }
