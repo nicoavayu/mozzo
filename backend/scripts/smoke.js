@@ -8,6 +8,8 @@ const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mozzo-sprint4-smoke-'));
 const dbPath = path.join(tempDir, 'database.sqlite');
 const port = 3310;
 const baseUrl = `http://127.0.0.1:${port}`;
+const adminPassword = 'admin123';
+const adminSecret = 'sprint4-smoke-secret';
 
 function waitForServer(childProcess) {
   return new Promise((resolve, reject) => {
@@ -48,13 +50,27 @@ async function requestJson(url, options = {}) {
   return { response, body };
 }
 
+async function loginAdmin() {
+  const login = await requestJson(`${baseUrl}/api/admin/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: adminPassword })
+  });
+
+  assert.equal(login.response.status, 200);
+  assert.ok(login.body.token);
+  return login.body.token;
+}
+
 async function main() {
   const server = spawn('node', ['server.js'], {
     cwd: path.resolve(__dirname, '..'),
     env: {
       ...process.env,
       PORT: String(port),
-      DB_PATH: dbPath
+      DB_PATH: dbPath,
+      ADMIN_PASSWORD: adminPassword,
+      ADMIN_TOKEN_SECRET: adminSecret
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -65,6 +81,7 @@ async function main() {
     const initial = await requestJson(`${baseUrl}/api/venue-settings`);
     assert.equal(initial.response.status, 200);
     assert.equal(initial.body.restaurant_name, 'Mozzo');
+    const adminToken = await loginAdmin();
 
     const payload = {
       restaurant_name: 'Mozzo Palermo',
@@ -77,7 +94,10 @@ async function main() {
 
     const saved = await requestJson(`${baseUrl}/api/admin/venue-settings`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`
+      },
       body: JSON.stringify(payload)
     });
     assert.equal(saved.response.status, 200);

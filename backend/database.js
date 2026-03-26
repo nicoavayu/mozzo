@@ -1,70 +1,118 @@
-const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
-const { runCreateVenueSettingsMigration } = require('./migrations/001_create_venue_settings');
+const dotenv = require('dotenv');
+const sqlite3 = require('sqlite3').verbose();
+const { runMigrations } = require('./lib/migrations');
 
-const dbPath = process.env.DB_PATH
-  ? path.resolve(process.env.DB_PATH)
-  : path.resolve(__dirname, 'database.sqlite');
+dotenv.config({ path: path.join(__dirname, '.env') });
+
+const dbPath = path.resolve(process.env.DB_PATH || process.env.DATABASE_PATH || path.join(__dirname, 'database.sqlite'));
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
     console.error('Error opening database', err.message);
   } else {
     console.log('Connected to SQLite database.');
-    db.serialize(() => {
-      db.run(`CREATE TABLE IF NOT EXISTS menu_categories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL
-    )`);
-
-      db.run(`CREATE TABLE IF NOT EXISTS menu_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        category_id INTEGER,
-        name TEXT NOT NULL,
-        description TEXT,
-        price REAL NOT NULL,
-        FOREIGN KEY (category_id) REFERENCES menu_categories (id)
-    )`);
-
-      db.run(`CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        table_id INTEGER NOT NULL,
-        status TEXT DEFAULT 'pending',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
-
-      db.run(`CREATE TABLE IF NOT EXISTS order_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id INTEGER,
-        item_id INTEGER,
-        quantity INTEGER NOT NULL,
-        comments TEXT,
-        FOREIGN KEY (order_id) REFERENCES orders (id),
-        FOREIGN KEY (item_id) REFERENCES menu_items (id)
-    )`);
-
-      runCreateVenueSettingsMigration(db, () => {
-        seedDB();
-      });
-    });
   }
 });
 
-function seedDB() {
-    db.get("SELECT count(*) as count FROM menu_categories", (err, row) => {
-        if (!err && row.count === 0) {
-            db.run("INSERT INTO menu_categories (name) VALUES ('Entradas'), ('Platos Principales'), ('Bebidas'), ('Postres')");
-            console.log("Categories seeded");
-            
-            setTimeout(() => {
-                db.run("INSERT INTO menu_items (category_id, name, description, price) VALUES (1, 'Nachos con Queso', 'Tortillas crujientes bañadas en queso fundido y jalapeños.', 8.50)");
-                db.run("INSERT INTO menu_items (category_id, name, description, price) VALUES (2, 'Hamburguesa Mozzo', 'Doble carne, bacon, queso cheddar y salsa especial.', 14.00)");
-                db.run("INSERT INTO menu_items (category_id, name, description, price) VALUES (2, 'Pizza Margarita', 'Salsa de tomate, mozzarella fresca y albahaca.', 12.00)");
-                db.run("INSERT INTO menu_items (category_id, name, description, price) VALUES (3, 'Limonada de Menta', 'Refrescante limonada natural con hojas de menta.', 4.50)");
-                db.run("INSERT INTO menu_items (category_id, name, description, price) VALUES (4, 'Brownie con Helado', 'Brownie caliente de chocolate con helado de vainilla.', 6.50)");
-                console.log("Menu items seeded");
-            }, 500);
-        }
+function run(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function onRun(err) {
+      if (err) {
+        reject(err);
+        return;
+      }
+
+      resolve({
+        lastID: this.lastID,
+        changes: this.changes
+      });
     });
+  });
 }
 
-module.exports = db;
+function get(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+
+      resolve(row);
+    });
+  });
+}
+
+function all(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+
+      resolve(rows);
+    });
+  });
+}
+
+function exec(sql) {
+  return new Promise((resolve, reject) => {
+    db.exec(sql, (err) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+
+      resolve();
+    });
+  });
+}
+
+async function withTransaction(work) {
+  await exec('BEGIN IMMEDIATE');
+
+  try {
+    const result = await work();
+    await exec('COMMIT');
+    return result;
+  } catch (error) {
+    try {
+      await exec('ROLLBACK');
+    } catch (rollbackError) {
+      console.error('Rollback failed', rollbackError.message);
+    }
+
+    throw error;
+  }
+}
+
+async function initializeDatabase() {
+  await exec('PRAGMA foreign_keys = ON');
+  await runMigrations({ db, run, get, all, exec, withTransaction });
+}
+
+function close() {
+  return new Promise((resolve, reject) => {
+    db.close((err) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+
+      resolve();
+    });
+  });
+}
+
+module.exports = {
+  db,
+  dbPath,
+  run,
+  get,
+  all,
+  exec,
+  withTransaction,
+  initializeDatabase,
+  close
+};

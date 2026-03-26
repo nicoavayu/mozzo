@@ -8,6 +8,8 @@ const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mozzo-sprint4-test-'));
 const dbPath = path.join(tempDir, 'database.sqlite');
 const port = 3311;
 const baseUrl = `http://127.0.0.1:${port}`;
+const adminPassword = 'admin123';
+const adminSecret = 'sprint4-test-secret';
 
 function waitForServer(childProcess) {
   return new Promise((resolve, reject) => {
@@ -48,13 +50,27 @@ async function requestJson(url, options = {}) {
   return { response, body };
 }
 
+async function loginAdmin() {
+  const login = await requestJson(`${baseUrl}/api/admin/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: adminPassword })
+  });
+
+  assert.equal(login.response.status, 200);
+  assert.ok(login.body.token);
+  return login.body.token;
+}
+
 async function main() {
   const server = spawn('node', ['server.js'], {
     cwd: path.resolve(__dirname, '..'),
     env: {
       ...process.env,
       PORT: String(port),
-      DB_PATH: dbPath
+      DB_PATH: dbPath,
+      ADMIN_PASSWORD: adminPassword,
+      ADMIN_TOKEN_SECRET: adminSecret
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -82,10 +98,14 @@ async function main() {
         feedback_url: ''
       }
     );
+    const adminToken = await loginAdmin();
 
     const missingName = await requestJson(`${baseUrl}/api/admin/venue-settings`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`
+      },
       body: JSON.stringify({
         restaurant_name: '',
         restaurant_subtitle: '',
@@ -100,7 +120,10 @@ async function main() {
 
     const invalidUrl = await requestJson(`${baseUrl}/api/admin/venue-settings`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`
+      },
       body: JSON.stringify({
         restaurant_name: 'Mozzo Test',
         restaurant_subtitle: '',
@@ -115,7 +138,10 @@ async function main() {
 
     const incompleteContact = await requestJson(`${baseUrl}/api/admin/venue-settings`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`
+      },
       body: JSON.stringify({
         restaurant_name: 'Mozzo Test',
         restaurant_subtitle: '',
@@ -130,7 +156,10 @@ async function main() {
 
     const validSave = await requestJson(`${baseUrl}/api/admin/venue-settings`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`
+      },
       body: JSON.stringify({
         restaurant_name: 'Mozzo Belgrano',
         restaurant_subtitle: 'Pizzas y tapas',
@@ -146,7 +175,10 @@ async function main() {
 
     const flexibleSave = await requestJson(`${baseUrl}/api/admin/venue-settings`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`
+      },
       body: JSON.stringify({
         restaurant_name: 'Mozzo Núñez',
         restaurant_subtitle: '',

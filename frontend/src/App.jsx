@@ -1,34 +1,61 @@
 import { useEffect, useState } from 'react';
-import { BrowserRouter, Routes, Route, useParams } from 'react-router-dom';
-import { io } from 'socket.io-client';
-import Menu from './components/Menu';
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
+import AdminLogin from './components/AdminLogin';
 import AdminPanel from './components/AdminPanel';
-import { ChefHat } from 'lucide-react';
+import TableShell from './components/table/TableShell';
+import TableDashboardPage from './components/table/TableDashboardPage';
+import TableMenuPage from './components/table/TableMenuPage';
+import TableOrderPage from './components/table/TableOrderPage';
+import { apiRequest } from './lib/api';
+import { socket } from './lib/socket';
+import { clearAdminToken, getAdminToken } from './lib/adminAuth';
 import { DEFAULT_VENUE_SETTINGS, normalizeVenueSettings } from './lib/venueSettings';
 
-const SOCKET_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
-const socket = io(SOCKET_URL);
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+function AdminRoute({ venueSettings, onVenueSettingsSaved }) {
+  const [adminToken, setAdminToken] = useState(() => getAdminToken());
+  const [adminTheme, setAdminTheme] = useState(() => {
+    if (typeof window === 'undefined') {
+      return 'dark';
+    }
 
-function TableView({ venueSettings }) {
-  const { tableId } = useParams();
-  
+    return window.localStorage.getItem('mozzo-admin-theme') || 'dark';
+  });
+
+  useEffect(() => {
+    window.localStorage.setItem('mozzo-admin-theme', adminTheme);
+    window.document.body.classList.toggle('admin-theme-light', adminTheme === 'light');
+
+    return () => {
+      window.document.body.classList.remove('admin-theme-light');
+    };
+  }, [adminTheme]);
+
+  const handleLogout = () => {
+    clearAdminToken();
+    setAdminToken(null);
+  };
+
+  if (!adminToken) {
+    return (
+      <AdminLogin
+        onLogin={setAdminToken}
+        venueSettings={venueSettings}
+        theme={adminTheme}
+        onToggleTheme={() => setAdminTheme((current) => (current === 'light' ? 'dark' : 'light'))}
+      />
+    );
+  }
+
   return (
-    <div className="app-container">
-      <header className="app-header">
-        <div className="brand-block">
-          <div className="logo">
-            <ChefHat size={32} color="var(--accent-color)" />
-            <span>{venueSettings.restaurant_name}</span>
-          </div>
-          {venueSettings.restaurant_subtitle && (
-            <p className="brand-subtitle">{venueSettings.restaurant_subtitle}</p>
-          )}
-        </div>
-        <div className="table-badge">Mesa {tableId}</div>
-      </header>
-      <Menu tableId={tableId} socket={socket} venueSettings={venueSettings} />
-    </div>
+    <AdminPanel
+      socket={socket}
+      adminToken={adminToken}
+      venueSettings={venueSettings}
+      onVenueSettingsSaved={onVenueSettingsSaved}
+      onLogout={handleLogout}
+      theme={adminTheme}
+      onToggleTheme={() => setAdminTheme((current) => (current === 'light' ? 'dark' : 'light'))}
+    />
   );
 }
 
@@ -36,17 +63,18 @@ function App() {
   const [venueSettings, setVenueSettings] = useState(DEFAULT_VENUE_SETTINGS);
 
   useEffect(() => {
+    let isMounted = true;
+
     const fetchVenueSettings = async () => {
       try {
-        const response = await fetch(`${API_URL}/api/venue-settings`);
-        if (!response.ok) {
-          throw new Error('No pudimos cargar la configuración del local.');
+        const data = await apiRequest('/api/venue-settings');
+        if (isMounted) {
+          setVenueSettings(normalizeVenueSettings(data));
         }
-
-        const data = await response.json();
-        setVenueSettings(normalizeVenueSettings(data));
       } catch {
-        setVenueSettings(DEFAULT_VENUE_SETTINGS);
+        if (isMounted) {
+          setVenueSettings(DEFAULT_VENUE_SETTINGS);
+        }
       }
     };
 
@@ -54,6 +82,7 @@ function App() {
     socket.on('venue_settings_updated', fetchVenueSettings);
 
     return () => {
+      isMounted = false;
       socket.off('venue_settings_updated', fetchVenueSettings);
     };
   }, []);
@@ -61,19 +90,21 @@ function App() {
   return (
     <BrowserRouter>
       <Routes>
+        <Route path="/" element={<Navigate to="/admin" replace />} />
         <Route
           path="/admin"
           element={
-            <AdminPanel
-              socket={socket}
+            <AdminRoute
               venueSettings={venueSettings}
-              onVenueSettingsSaved={(nextSettings) => {
-                setVenueSettings(normalizeVenueSettings(nextSettings));
-              }}
+              onVenueSettingsSaved={(nextSettings) => setVenueSettings(normalizeVenueSettings(nextSettings))}
             />
           }
         />
-        <Route path="/:tableId" element={<TableView venueSettings={venueSettings} />} />
+        <Route path="/:tableId" element={<TableShell socket={socket} venueSettings={venueSettings} />}>
+          <Route index element={<TableDashboardPage />} />
+          <Route path="menu" element={<TableMenuPage />} />
+          <Route path="pedido" element={<TableOrderPage />} />
+        </Route>
       </Routes>
     </BrowserRouter>
   );

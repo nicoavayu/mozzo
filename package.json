@@ -1,0 +1,19 @@
+{
+  "name": "mozzo",
+  "private": true,
+  "packageManager": "npm@10.9.2",
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "scripts": {
+    "setup": "npm ci --prefix frontend && npm ci --prefix backend",
+    "dev": "sh -c 'npm run dev --prefix backend & npm run dev --prefix frontend'",
+    "dev:backend": "npm run dev --prefix backend",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "db:migrate": "npm run db:migrate --prefix backend",
+    "db:seed": "npm run db:seed --prefix backend",
+    "smoke": "npm run smoke --prefix backend",
+    "build": "npm run build --prefix frontend",
+    "check": "npm run check --prefix backend && npm run check --prefix frontend"
+  }
+}

@@ -1,5 +1,7 @@
+import { RESTAURANT_NAME } from './config.js';
+
 export const DEFAULT_VENUE_SETTINGS = Object.freeze({
-  restaurant_name: 'Mozzo',
+  restaurant_name: RESTAURANT_NAME,
   restaurant_subtitle: '',
   contact_label: '',
   contact_url: '',
@@ -63,7 +65,7 @@ export function validateVenueSettingsForm(value = {}) {
 
   ['contact_url', 'review_url', 'feedback_url'].forEach((field) => {
     if (normalized[field] && !isValidHttpUrl(normalized[field])) {
-      errors[field] = 'Ingresá una URL válida con http o https.';
+      errors[field] = 'Ingresá una URL válida.';
     }
   });
 

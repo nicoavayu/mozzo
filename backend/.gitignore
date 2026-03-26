@@ -1,8 +1,14 @@
 node_modules/
 uploads/
+backups/
 *.db
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 venv/
 __pycache__/
 .env
+.env.*
+!.env.example
 *.pyc
 *.log

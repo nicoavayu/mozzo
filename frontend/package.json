@@ -3,13 +3,19 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=22 <23"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview",
     "check": "npm run lint && npm run build",
-    "test:sprint4": "node scripts/test-sprint4.js"
+    "test:sprint1": "node scripts/test-sprint1.js",
+    "test:sprint2": "node scripts/test-sprint2.js",
+    "test:sprint3": "node scripts/test-sprint3.js",
+    "test:sprint4": "node scripts/test-sprint4.js",
+    "preview": "vite preview"
   },
   "dependencies": {
     "lucide-react": "^1.0.1",
