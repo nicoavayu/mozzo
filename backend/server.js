@@ -20,10 +20,14 @@ const { extractStructuredMenuOcr } = require('./lib/menu-import');
 const {
     createOrder,
     createOrderError,
+    createOrderPayment,
     clearBillRequestedForTable,
     closeOpenOrderForTable,
+    closeOrderById,
     getActiveOrderForTable,
     getClosedOrdersHistorySummary,
+    getOrderById,
+    getOrderPaymentSummary,
     getOrderSessionForTable,
     listClosedOrdersHistory,
     listOpenOrders,
@@ -31,19 +35,44 @@ const {
     markBillAttendedForTable,
     markBillRequestedForTable,
     markPaymentReceivedForTable,
+    normalizeBillPaymentMethodPreference,
+    reverseOrderPayment,
     updateOrderStatus
 } = require('./lib/orders');
 const {
+    appendSuborderToActiveOrder,
+    listOpenSuborders,
+    updateSuborderStatus,
+} = require('./lib/order-suborders');
+const {
     createTableRequest,
+    getTableRequestById,
     listActiveTableRequestsForTable,
     listTableRequests,
     cancelTableRequestForTable,
     resolvePendingTableRequestsForTable,
+    resolvePendingTableRequestsForTableByType,
     resolveTableRequest
 } = require('./lib/table-requests');
 const { listTables, createTable, deleteTable } = require('./lib/tables');
 const { issueAdminToken, verifyAdminPassword, verifyAdminToken } = require('./lib/auth');
 const { requireAdmin } = require('./middleware/requireAdmin');
+const {
+    closeRegister,
+    getOpenRegister,
+    getRegisterSessionById,
+    listRegisterSessions,
+    openRegister
+} = require('./lib/cash-register');
+const {
+    buildMercadoPagoReturnRedirect,
+    createCheckoutForTable,
+    extractMercadoPagoExternalReference,
+    extractMercadoPagoPaymentId,
+    getCheckoutByExternalReference,
+    isMercadoPagoConfigured,
+    syncMercadoPagoCheckout,
+} = require('./lib/mercado-pago');
 
 const backendRoot = __dirname;
 const uploadDir = path.resolve(process.env.UPLOAD_DIR || path.join(backendRoot, 'uploads'));
@@ -124,6 +153,34 @@ function emitOrderUpdated(order) {
     io.to(tableRoom(order.table_id)).emit('order_updated', order);
 }
 
+function emitSuborderCreated(suborder, order = null) {
+    if (!suborder) {
+        return;
+    }
+
+    const payload = {
+        suborder,
+        order: order || null,
+    };
+
+    io.to('admin_room').emit('suborder_created', payload);
+    io.to(tableRoom(suborder.table_id)).emit('suborder_created', payload);
+}
+
+function emitSuborderUpdated(suborder, order = null) {
+    if (!suborder) {
+        return;
+    }
+
+    const payload = {
+        suborder,
+        order: order || null,
+    };
+
+    io.to('admin_room').emit('suborder_updated', payload);
+    io.to(tableRoom(suborder.table_id)).emit('suborder_updated', payload);
+}
+
 function emitTableRequestCreated(request) {
     io.to('admin_room').emit('table_request_created', request);
     io.to(tableRoom(request.table_id)).emit('table_request_created', request);
@@ -134,17 +191,27 @@ function emitTableRequestUpdated(request) {
     io.to(tableRoom(request.table_id)).emit('table_request_updated', request);
 }
 
+function emitCashRegisterUpdated(session = null) {
+    io.to('admin_room').emit('cash_register_updated', session ? { id: session.id, status: session.status } : { status: 'updated' });
+}
+
 function sendOrderHttpError(res, error) {
     const status = error.status || 500;
     res.status(status).json({
         error: error.message,
         code: error.code || 'UNKNOWN',
-        unavailable_items: Array.isArray(error.unavailable_items) ? error.unavailable_items : undefined
+        unavailable_items: Array.isArray(error.unavailable_items) ? error.unavailable_items : undefined,
+        amount_due: Number.isFinite(Number(error.amount_due)) ? Number(error.amount_due) : undefined,
+        reversible_amount: Number.isFinite(Number(error.reversible_amount)) ? Number(error.reversible_amount) : undefined,
     });
 }
 
 function getFrontendHost() {
     return (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
+}
+
+function getBackendHost() {
+    return (process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 3000}`).replace(/\/$/, '');
 }
 
 function buildTableUrl(tableId) {
@@ -228,6 +295,91 @@ app.get('/api/guest-links', async (req, res) => {
         });
     } catch (error) {
         res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/payments/mercado-pago/status', async (req, res) => {
+    res.json({
+        enabled: isMercadoPagoConfigured(),
+        backend_url: getBackendHost(),
+    });
+});
+
+app.get('/api/admin/cash-register/current', requireAdmin, async (req, res) => {
+    try {
+        const currentSession = await getOpenRegister(database);
+        res.json(currentSession);
+    } catch (error) {
+        res.status(error.status || 500).json({
+            error: error.message,
+            code: error.code || 'UNKNOWN'
+        });
+    }
+});
+
+app.post('/api/admin/cash-register/open', requireAdmin, async (req, res) => {
+    try {
+        const session = await database.withTransaction(async () => openRegister(database, {
+            opening_float: req.body?.opening_float,
+            notes_open: req.body?.notes_open,
+            opened_by: req.admin?.role || null,
+        }));
+        emitCashRegisterUpdated(session);
+        res.status(201).json(session);
+    } catch (error) {
+        res.status(error.status || 500).json({
+            error: error.message,
+            code: error.code || 'UNKNOWN'
+        });
+    }
+});
+
+app.post('/api/admin/cash-register/current/close', requireAdmin, async (req, res) => {
+    try {
+        const session = await database.withTransaction(async () => closeRegister(database, {
+            counted_cash_amount: req.body?.counted_cash_amount,
+            notes_close: req.body?.notes_close,
+            closed_by: req.admin?.role || null,
+        }));
+        emitCashRegisterUpdated(session);
+        res.json(session);
+    } catch (error) {
+        res.status(error.status || 500).json({
+            error: error.message,
+            code: error.code || 'UNKNOWN'
+        });
+    }
+});
+
+app.get('/api/admin/cash-register/history', requireAdmin, async (req, res) => {
+    try {
+        const history = await listRegisterSessions(database, { limit: req.query?.limit });
+        res.json(history);
+    } catch (error) {
+        res.status(error.status || 500).json({
+            error: error.message,
+            code: error.code || 'UNKNOWN'
+        });
+    }
+});
+
+app.get('/api/admin/cash-register/:id', requireAdmin, async (req, res) => {
+    try {
+        const session = await getRegisterSessionById(database, req.params.id);
+
+        if (!session) {
+            return res.status(404).json({
+                error: 'No encontramos esa sesión de caja.',
+                code: 'CASH_REGISTER_NOT_FOUND'
+            });
+        }
+
+        res.json(session);
+    } catch (error) {
+        res.status(error.status || 500).json({
+            error: error.message,
+            code: error.code || 'UNKNOWN'
+        });
     }
 });
 
@@ -440,6 +592,87 @@ app.get('/api/tables/:id/orders/session', async (req, res) => {
     }
 });
 
+app.post('/api/tables/:id/mercado-pago/checkout', async (req, res) => {
+    try {
+        const settings = await readVenueSettings(database);
+        const checkout = await createCheckoutForTable(
+            database,
+            req.params.id,
+            {
+                restaurant_name: settings.restaurant_name,
+            }
+        );
+        res.status(201).json(checkout);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.post('/api/payments/mercado-pago/webhook', async (req, res) => {
+    try {
+        const paymentId = extractMercadoPagoPaymentId(req.body, req.query);
+        const externalReference = extractMercadoPagoExternalReference(req.body, req.query);
+        const result = await syncMercadoPagoCheckout(database, {
+            paymentId,
+            externalReference,
+            eventSource: 'webhook',
+        });
+
+        if (result?.applied && result?.order) {
+            emitOrderUpdated(result.order);
+            emitCashRegisterUpdated();
+        }
+
+        res.status(200).json({ received: true });
+    } catch (error) {
+        console.error('Mercado Pago webhook failed', error);
+        res.status(200).json({ received: true, ignored: true });
+    }
+});
+
+app.get('/api/payments/mercado-pago/return', async (req, res) => {
+    const paymentId = extractMercadoPagoPaymentId({}, req.query);
+    const externalReference = extractMercadoPagoExternalReference({}, req.query);
+    const fallbackStatus = String(req.query.result || req.query.status || 'pending').trim().toLowerCase();
+
+    try {
+        const result = await syncMercadoPagoCheckout(database, {
+            paymentId,
+            externalReference,
+            eventSource: 'return',
+        });
+        const order = result?.order || (result?.checkout?.order_id ? await getOrderById(database, result.checkout.order_id) : null);
+        const mpStatus = result?.checkout?.status === 'approved' && result?.checkout?.sync_disposition === 'applied'
+            ? 'approved'
+            : result?.checkout?.status === 'pending'
+                && result?.checkout?.sync_disposition === 'pending'
+                ? 'pending'
+                : ['rejected', 'cancelled', 'expired', 'failed', 'refunded', 'charged_back', 'reversed'].includes(result?.checkout?.status)
+                    || ['ignored', 'stale', 'mismatched'].includes(result?.checkout?.sync_disposition)
+                    ? 'failure'
+                    : fallbackStatus === 'approved'
+                        ? 'approved'
+                        : fallbackStatus === 'pending'
+                            ? 'pending'
+                            : 'failure';
+
+        if (result?.applied && order) {
+            emitOrderUpdated(order);
+            if (result?.checkout?.status === 'approved') {
+                emitCashRegisterUpdated();
+            }
+        }
+
+        if (order) {
+            return res.redirect(buildMercadoPagoReturnRedirect(order.table_id, mpStatus));
+        }
+    } catch (error) {
+        console.error('Mercado Pago return sync failed', error);
+    }
+
+    return res.redirect(`${getFrontendHost()}?mp_status=${encodeURIComponent(fallbackStatus || 'pending')}`);
+});
+
 app.get('/api/tables/:id/requests/active', async (req, res) => {
     try {
         const requests = await listActiveTableRequestsForTable(database, req.params.id);
@@ -469,24 +702,67 @@ app.post('/api/tables/:id/call-waiter', async (req, res) => {
 
 app.post('/api/tables/:id/request-bill', async (req, res) => {
     try {
-        const { tableRequest, order } = await database.withTransaction(async () => {
-            const nextOrder = await markBillRequestedForTable(database, req.params.id);
+        const preferredPaymentMethod = normalizeBillPaymentMethodPreference(
+            req.body?.preferred_payment_method,
+            { allowNull: false }
+        );
+
+        const { tableRequest, resolvedRequests, order } = await database.withTransaction(async () => {
+            const nextOrder = await markBillRequestedForTable(database, req.params.id, preferredPaymentMethod);
+
+            if (preferredPaymentMethod === 'mercado_pago') {
+                const nextResolvedRequests = await resolvePendingTableRequestsForTableByType(
+                    database,
+                    req.params.id,
+                    'request_bill'
+                );
+
+                return {
+                    tableRequest: null,
+                    resolvedRequests: nextResolvedRequests,
+                    order: nextOrder,
+                };
+            }
+
             const nextTableRequest = await createTableRequest(database, {
                 table_id: req.params.id,
                 type: 'request_bill'
             });
 
-            return { tableRequest: nextTableRequest, order: nextOrder };
+            return {
+                tableRequest: nextTableRequest,
+                resolvedRequests: [],
+                order: nextOrder,
+            };
         });
 
         emitOrderUpdated(order);
+        resolvedRequests.forEach(emitTableRequestUpdated);
 
-        if (!tableRequest.already_pending) {
+        if (tableRequest && !tableRequest.already_pending) {
             emitTableRequestCreated(tableRequest);
-            return res.status(201).json(tableRequest);
+            return res.status(201).json({
+                ...(tableRequest || {}),
+                table_request: tableRequest,
+                resolved_requests: resolvedRequests,
+                order,
+                preferred_payment_method: order.bill_payment_method_preference,
+                should_start_online_checkout: order.bill_payment_method_preference === 'mercado_pago',
+            });
         }
 
-        res.json(tableRequest);
+        if (tableRequest?.already_pending) {
+            emitTableRequestUpdated(tableRequest);
+        }
+
+        res.json({
+            ...(tableRequest || {}),
+            table_request: tableRequest,
+            resolved_requests: resolvedRequests,
+            order,
+            preferred_payment_method: order.bill_payment_method_preference,
+            should_start_online_checkout: order.bill_payment_method_preference === 'mercado_pago',
+        });
     } catch (error) {
         sendOrderHttpError(res, error);
     }
@@ -545,13 +821,19 @@ app.delete('/api/tables/:id/request-bill', async (req, res) => {
         if (tableRequest) {
             emitTableRequestUpdated(tableRequest);
         }
-        res.json(tableRequest || {
-            id: null,
-            table_id: Number(req.params.id),
-            type: 'request_bill',
-            status: 'resolved',
-            resolved_at: new Date().toISOString(),
-            already_resolved: true
+        const fallbackTableRequest = tableRequest || {
+                id: null,
+                table_id: Number(req.params.id),
+                type: 'request_bill',
+                status: 'resolved',
+                resolved_at: new Date().toISOString(),
+                already_resolved: true
+            };
+
+        res.json({
+            ...fallbackTableRequest,
+            table_request: fallbackTableRequest,
+            order,
         });
     } catch (error) {
         sendOrderHttpError(res, error);
@@ -563,6 +845,22 @@ app.post('/api/orders', async (req, res) => {
         const order = await createOrder(database, req.body);
         emitOrderCreated(order);
         res.status(201).json(order);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.post('/api/tables/:id/suborders', async (req, res) => {
+    try {
+        const { order, suborder } = await database.withTransaction(async () => {
+            const nextSuborder = await appendSuborderToActiveOrder(database, req.params.id, req.body || {});
+            const nextOrder = await getOrderById(database, nextSuborder.order_id);
+            return { order: nextOrder, suborder: nextSuborder };
+        });
+
+        emitSuborderCreated(suborder, order);
+        emitOrderUpdated(order);
+        res.status(201).json({ order, suborder });
     } catch (error) {
         sendOrderHttpError(res, error);
     }
@@ -595,6 +893,127 @@ app.get('/api/admin/orders/open', requireAdmin, async (req, res) => {
     }
 });
 
+app.get('/api/admin/suborders/open', requireAdmin, async (req, res) => {
+    try {
+        const suborders = await listOpenSuborders(database);
+        const uniqueOrderIds = [...new Set(suborders.map((suborder) => suborder.order_id).filter(Boolean))];
+        const ordersById = new Map();
+
+        await Promise.all(uniqueOrderIds.map(async (orderId) => {
+            const order = await getOrderById(database, orderId);
+            if (order) {
+                ordersById.set(orderId, order);
+            }
+        }));
+
+        const payload = suborders.map((suborder) => {
+            const order = ordersById.get(suborder.order_id) || null;
+
+            return {
+                ...suborder,
+                session_total_amount: order?.total_amount || 0,
+                session_amount_paid: order?.amount_paid || 0,
+                session_amount_due: order?.amount_due || 0,
+                session_payment_status: order?.payment_status || 'unpaid',
+                bill_requested_at: order?.bill_requested_at || suborder.bill_requested_at || null,
+                bill_payment_method_preference: order?.bill_payment_method_preference || null,
+                order_status: order?.status || null,
+            };
+        });
+
+        res.json(payload);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.post('/api/admin/suborders/:id/status', requireAdmin, async (req, res) => {
+    try {
+        const { suborder, order } = await database.withTransaction(async () => {
+            const nextSuborder = await updateSuborderStatus(database, req.params.id, req.body?.status);
+            const nextOrder = await getOrderById(database, nextSuborder.order_id);
+            return { suborder: nextSuborder, order: nextOrder };
+        });
+
+        emitSuborderUpdated(suborder, order);
+        emitOrderUpdated(order);
+        res.json({ suborder, order });
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.get('/api/admin/orders/:id/payments', requireAdmin, async (req, res) => {
+    try {
+        const paymentSummary = await getOrderPaymentSummary(database, req.params.id);
+        res.json(paymentSummary);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.post('/api/admin/orders/:id/payments', requireAdmin, async (req, res) => {
+    try {
+        const order = await database.withTransaction(async () => createOrderPayment(
+            database,
+            req.params.id,
+            {
+                amount: req.body?.amount,
+                method: req.body?.method,
+                note: req.body?.note,
+            },
+            {
+                created_by: req.admin?.role || null,
+            }
+        ));
+
+        emitOrderUpdated(order);
+        emitCashRegisterUpdated();
+        res.status(201).json(order);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.post('/api/admin/orders/:orderId/payments/:paymentId/reversals', requireAdmin, async (req, res) => {
+    try {
+        const order = await database.withTransaction(async () => reverseOrderPayment(
+            database,
+            req.params.orderId,
+            req.params.paymentId,
+            {
+                amount: req.body?.amount,
+                reason: req.body?.reason,
+            },
+            {
+                created_by: req.admin?.role || null,
+            }
+        ));
+
+        emitOrderUpdated(order);
+        emitCashRegisterUpdated();
+        res.status(201).json(order);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.post('/api/admin/orders/:id/close', requireAdmin, async (req, res) => {
+    try {
+        const { order, resolvedRequests } = await database.withTransaction(async () => {
+            const nextOrder = await closeOrderById(database, req.params.id);
+            const nextResolvedRequests = await resolvePendingTableRequestsForTable(database, nextOrder.table_id);
+            return { order: nextOrder, resolvedRequests: nextResolvedRequests };
+        });
+
+        resolvedRequests.forEach(emitTableRequestUpdated);
+        emitOrderUpdated(order);
+        res.json(order);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
 // 3. Get all orders (for admin initial load)
 app.get('/api/orders', requireAdmin, async (req, res) => {
     try {
@@ -621,8 +1040,11 @@ app.post('/api/table-requests/:id/resolve', requireAdmin, async (req, res) => {
             const nextOrder = nextTableRequest.type === 'request_bill'
                 ? await markBillAttendedForTable(database, nextTableRequest.table_id)
                 : null;
+            const refreshedTableRequest = nextTableRequest.type === 'request_bill'
+                ? await getTableRequestById(database, nextTableRequest.id)
+                : nextTableRequest;
 
-            return { tableRequest: nextTableRequest, order: nextOrder };
+            return { tableRequest: refreshedTableRequest, order: nextOrder };
         });
 
         emitOrderUpdated(order);
@@ -651,18 +1073,21 @@ app.post('/api/tables/:id/close', requireAdmin, async (req, res) => {
 
 app.post('/api/tables/:id/payment', requireAdmin, async (req, res) => {
     try {
-        const { order, resolvedRequests } = await database.withTransaction(async () => {
+        const order = await database.withTransaction(async () => {
             const nextOrder = await markPaymentReceivedForTable(
                 database,
                 req.params.id,
-                req.body?.payment_method
+                req.body?.payment_method,
+                {
+                    note: req.body?.note,
+                    created_by: req.admin?.role || null,
+                }
             );
-            const nextResolvedRequests = await resolvePendingTableRequestsForTable(database, req.params.id);
-            return { order: nextOrder, resolvedRequests: nextResolvedRequests };
+            return nextOrder;
         });
 
-        resolvedRequests.forEach(emitTableRequestUpdated);
         emitOrderUpdated(order);
+        emitCashRegisterUpdated();
         res.json(order);
     } catch (error) {
         sendOrderHttpError(res, error);
@@ -729,8 +1154,11 @@ io.on('connection', (socket) => {
         }
 
         try {
-            const order = await updateOrderStatus(database, data.order_id, data.status);
-            emitOrderUpdated(order);
+            const result = await updateOrderStatus(database, data.order_id, data.status);
+            if (result?.suborder) {
+                emitSuborderUpdated(result.suborder, result.order || null);
+            }
+            emitOrderUpdated(result?.order || result);
         } catch (error) {
             sendSocketOrderError(socket, error);
         }

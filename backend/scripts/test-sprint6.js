@@ -198,7 +198,19 @@ async function closeOrder(baseUrl, adminToken, adminSocket, { tableId, itemId, q
   assert.equal(payment.response.status, 200);
   await paidOrder;
 
-  return payment.body;
+  const closedOrder = waitForSocketEvent(
+    adminSocket,
+    'order_updated',
+    (order) => order?.id === orderId && Boolean(order?.closed_at)
+  );
+  const close = await requestJson(`${baseUrl}/api/admin/orders/${orderId}/close`, {
+    method: 'POST',
+    headers: authHeaders(adminToken),
+  });
+  assert.equal(close.response.status, 200);
+  await closedOrder;
+
+  return close.body;
 }
 
 async function main() {
@@ -245,7 +257,7 @@ async function main() {
         tableId: 11,
         itemId: firstItemId,
         quantity: 2,
-        paymentMethod: 'cash',
+        paymentMethod: 'transfer',
       });
       const secondPaidOrder = await closeOrder(baseUrl, adminToken, adminSocket, {
         tableId: 12,
@@ -296,7 +308,7 @@ async function main() {
         headers: authHeaders(adminToken),
       });
       assert.equal(invalidPayment.response.status, 400);
-      assert.equal(invalidPayment.body.code, 'INVALID_PAYMENT_METHOD');
+      assert.equal(invalidPayment.body.code, 'INVALID_HISTORY_FILTER');
     } finally {
       adminSocket.close();
     }

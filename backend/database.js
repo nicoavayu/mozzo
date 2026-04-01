@@ -36,6 +36,8 @@ const db = new sqlite3.Database(dbPath, (err) => {
   }
 });
 
+let transactionQueue = Promise.resolve();
+
 function run(sql, params = []) {
   return new Promise((resolve, reject) => {
     db.run(sql, params, function onRun(err) {
@@ -92,21 +94,31 @@ function exec(sql) {
 }
 
 async function withTransaction(work) {
-  await exec('BEGIN IMMEDIATE');
+  const runTransaction = async () => {
+    await exec('BEGIN IMMEDIATE');
 
-  try {
-    const result = await work();
-    await exec('COMMIT');
-    return result;
-  } catch (error) {
     try {
-      await exec('ROLLBACK');
-    } catch (rollbackError) {
-      console.error('Rollback failed', rollbackError.message);
-    }
+      const result = await work();
+      await exec('COMMIT');
+      return result;
+    } catch (error) {
+      try {
+        await exec('ROLLBACK');
+      } catch (rollbackError) {
+        console.error('Rollback failed', rollbackError.message);
+      }
 
-    throw error;
-  }
+      throw error;
+    }
+  };
+
+  const nextTransaction = transactionQueue.then(runTransaction, runTransaction);
+  transactionQueue = nextTransaction.then(
+    () => undefined,
+    () => undefined
+  );
+
+  return nextTransaction;
 }
 
 async function initializeDatabase() {

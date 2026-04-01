@@ -1,7 +1,38 @@
+const {
+  MONEY_EPSILON,
+  createPaymentForOrder: createPaymentRecord,
+  createPaymentReversalForPayment: createPaymentReversalRecord,
+  listPaymentsForOrder,
+  listPaymentsForOrderIds,
+  normalizePaymentMethod,
+  roundMoney,
+  summarizeOrderPayments,
+  validatePaymentAgainstOrder,
+  validatePaymentReversalAgainstPayment,
+} = require('./order-payments');
+const { getOpenRegister } = require('./cash-register');
+const {
+  createInitialSuborderForOrder,
+  listSubordersForOrder,
+  listSubordersForOrderIds,
+  summarizeSuborders,
+  updateSuborderStatus,
+} = require('./order-suborders');
+
 const ACTIVE_ORDER_STATUSES = ['pending', 'processing', 'ready', 'delivered'];
 const VALID_ORDER_STATUSES = new Set(ACTIVE_ORDER_STATUSES);
-const VALID_PAYMENT_METHODS = new Set(['cash', 'card', 'transfer', 'other']);
 const VALID_HISTORY_PRESETS = new Set(['today', 'last_7_days']);
+const VALID_HISTORY_PAYMENT_FILTERS = new Set(['cash', 'card', 'transfer', 'other', 'mercado_pago', 'split']);
+const LEGACY_ORDER_PAYMENT_METHODS = new Set(['cash', 'card', 'transfer', 'other']);
+const VALID_BILL_PAYMENT_METHOD_PREFERENCES = new Set(['cash', 'card', 'mercado_pago']);
+const VALID_BILL_COLLECTION_STATUSES = new Set([
+  'requested',
+  'waiting_cash',
+  'waiting_card',
+  'checkout_pending',
+  'partial_payment',
+  'payment_recorded',
+]);
 const MAX_COMMENT_LENGTH = 250;
 const DEFAULT_HISTORY_LIMIT = 50;
 const MAX_HISTORY_LIMIT = 200;
@@ -45,6 +76,33 @@ function normalizeComments(value, fieldName) {
   return normalizedValue;
 }
 
+function normalizeBillPaymentMethodPreference(value, { allowNull = false } = {}) {
+  if (value == null || String(value).trim() === '') {
+    return allowNull ? null : 'cash';
+  }
+
+  const normalizedValue = String(value).trim().toLowerCase();
+
+  if (!VALID_BILL_PAYMENT_METHOD_PREFERENCES.has(normalizedValue)) {
+    throw createOrderError(
+      'INVALID_BILL_PAYMENT_METHOD',
+      'El medio elegido para pedir la cuenta es inválido.',
+      400
+    );
+  }
+
+  return normalizedValue;
+}
+
+function normalizeBillCollectionStatus(value) {
+  if (value == null || String(value).trim() === '') {
+    return null;
+  }
+
+  const normalizedValue = String(value).trim().toLowerCase();
+  return VALID_BILL_COLLECTION_STATUSES.has(normalizedValue) ? normalizedValue : null;
+}
+
 function normalizeOrderPayload(payload) {
   const tableId = ensurePositiveInteger(payload?.table_id, 'table_id');
   const rawItems = payload?.items;
@@ -63,16 +121,6 @@ function normalizeOrderPayload(payload) {
     table_id: tableId,
     items
   };
-}
-
-function normalizePaymentMethod(value) {
-  const normalizedValue = String(value || '').trim().toLowerCase();
-
-  if (!VALID_PAYMENT_METHODS.has(normalizedValue)) {
-    throw createOrderError('INVALID_PAYMENT_METHOD', 'El medio de pago es inválido.', 400);
-  }
-
-  return normalizedValue;
 }
 
 function padDateSegment(value) {
@@ -155,7 +203,11 @@ function normalizeHistoryFilters(rawFilters = {}) {
 
   const paymentMethodValue = String(rawFilters.payment_method || '').trim().toLowerCase();
   const paymentMethod = paymentMethodValue
-    ? normalizePaymentMethod(paymentMethodValue)
+    ? (VALID_HISTORY_PAYMENT_FILTERS.has(paymentMethodValue)
+      ? paymentMethodValue
+      : (() => {
+          throw createOrderError('INVALID_HISTORY_FILTER', 'El filtro de medio de pago es inválido.', 400);
+        })())
     : null;
 
   const limitValue = rawFilters.limit == null ? DEFAULT_HISTORY_LIMIT : Number(rawFilters.limit);
@@ -181,18 +233,10 @@ function normalizeHistoryFilters(rawFilters = {}) {
   };
 }
 
-function buildHistoryWhereClause(filters) {
-  const conditions = ['o.closed_at IS NOT NULL', 'o.closed_at >= ?', 'o.closed_at <= ?'];
-  const params = [filters.fromSql, filters.toSql];
-
-  if (filters.payment_method) {
-    conditions.push('o.payment_method = ?');
-    params.push(filters.payment_method);
-  }
-
+function buildClosedHistoryWhereClause(filters) {
   return {
-    whereClause: `WHERE ${conditions.join(' AND ')}`,
-    params,
+    whereClause: 'WHERE o.closed_at IS NOT NULL AND o.closed_at >= ? AND o.closed_at <= ?',
+    params: [filters.fromSql, filters.toSql],
   };
 }
 
@@ -217,6 +261,147 @@ function buildOrderDurations(order) {
     to_bill_minutes: calculateDurationMinutes(order.created_at, order.bill_attended_at),
     to_payment_minutes: calculateDurationMinutes(order.created_at, order.payment_received_at),
   };
+}
+
+function computeBillCollectionStatus(order) {
+  if (!order?.bill_requested_at) {
+    return null;
+  }
+
+  const amountPaid = Number(order?.amount_paid || 0);
+  const amountDue = Number(order?.amount_due || 0);
+  const preferredMethod = normalizeBillPaymentMethodPreference(
+    order?.bill_payment_method_preference,
+    { allowNull: true }
+  );
+
+  if (amountDue <= MONEY_EPSILON) {
+    return 'payment_recorded';
+  }
+
+  if (amountPaid > MONEY_EPSILON) {
+    return 'partial_payment';
+  }
+
+  switch (preferredMethod) {
+    case 'cash':
+      return 'waiting_cash';
+    case 'card':
+      return 'waiting_card';
+    case 'mercado_pago':
+      return 'checkout_pending';
+    default:
+      return 'requested';
+  }
+}
+
+function mapExternalPaymentAttemptRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: row.id,
+    provider: 'mercado_pago',
+    order_id: row.order_id,
+    amount: roundMoney(row.amount),
+    currency_id: row.currency_id || 'ARS',
+    status: row.status,
+    sync_disposition: row.sync_disposition || 'pending',
+    external_reference: row.external_reference,
+    preference_id: row.preference_id || null,
+    payment_id: row.payment_id || null,
+    payment_status: row.payment_status || null,
+    payment_status_detail: row.payment_status_detail || null,
+    payer_email: row.payer_email || null,
+    order_payment_id: row.order_payment_id || null,
+    status_reason: row.status_reason || null,
+    expires_at: row.expires_at || null,
+    approved_at: row.approved_at || null,
+    last_checked_at: row.last_checked_at || null,
+    last_event_source: row.last_event_source || null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+function summarizeExternalPaymentAttempts(attempts = []) {
+  const normalizedAttempts = Array.isArray(attempts) ? attempts.filter(Boolean) : [];
+  const latestAttempt = normalizedAttempts[normalizedAttempts.length - 1] || null;
+
+  return {
+    total_attempts: normalizedAttempts.length,
+    pending_count: normalizedAttempts.filter((attempt) => attempt.sync_disposition === 'pending').length,
+    applied_count: normalizedAttempts.filter((attempt) => attempt.sync_disposition === 'applied').length,
+    ignored_count: normalizedAttempts.filter((attempt) => attempt.sync_disposition === 'ignored').length,
+    stale_count: normalizedAttempts.filter((attempt) => attempt.sync_disposition === 'stale').length,
+    mismatched_count: normalizedAttempts.filter((attempt) => attempt.sync_disposition === 'mismatched').length,
+    has_issues: normalizedAttempts.some((attempt) => ['stale', 'mismatched'].includes(attempt.sync_disposition)),
+    latest_status: latestAttempt?.status || null,
+    latest_sync_disposition: latestAttempt?.sync_disposition || null,
+    latest_status_reason: latestAttempt?.status_reason || null,
+    latest_payment_id: latestAttempt?.payment_id || null,
+    latest_external_reference: latestAttempt?.external_reference || null,
+  };
+}
+
+async function listExternalPaymentAttemptsForOrderIds(database, orderIds = []) {
+  const uniqueOrderIds = [
+    ...new Set(
+      (orderIds || [])
+        .map((orderId) => Number(orderId))
+        .filter((orderId) => Number.isInteger(orderId) && orderId > 0)
+    ),
+  ];
+
+  if (uniqueOrderIds.length === 0) {
+    return new Map();
+  }
+
+  const placeholders = uniqueOrderIds.map(() => '?').join(', ');
+  const rows = await database.all(
+    `
+      SELECT
+        id,
+        order_id,
+        amount,
+        currency_id,
+        status,
+        sync_disposition,
+        external_reference,
+        preference_id,
+        payment_id,
+        payment_status,
+        payment_status_detail,
+        payer_email,
+        order_payment_id,
+        status_reason,
+        expires_at,
+        approved_at,
+        last_checked_at,
+        last_event_source,
+        created_at,
+        updated_at
+      FROM mercado_pago_checkouts
+      WHERE order_id IN (${placeholders})
+      ORDER BY created_at ASC, id ASC
+    `,
+    uniqueOrderIds
+  );
+
+  const attemptsByOrderId = new Map(uniqueOrderIds.map((orderId) => [orderId, []]));
+
+  for (const row of rows) {
+    const attempt = mapExternalPaymentAttemptRow(row);
+
+    if (!attemptsByOrderId.has(attempt.order_id)) {
+      attemptsByOrderId.set(attempt.order_id, []);
+    }
+
+    attemptsByOrderId.get(attempt.order_id).push(attempt);
+  }
+
+  return attemptsByOrderId;
 }
 
 function average(values = []) {
@@ -244,6 +429,11 @@ function mapOrderRows(rows) {
         delivered_at: row.delivered_at,
         bill_requested_at: row.bill_requested_at,
         bill_attended_at: row.bill_attended_at,
+        bill_payment_method_preference: normalizeBillPaymentMethodPreference(
+          row.bill_payment_method_preference,
+          { allowNull: true }
+        ),
+        bill_collection_status: normalizeBillCollectionStatus(row.bill_collection_status),
         payment_received_at: row.payment_received_at,
         payment_method: row.payment_method,
         closed_at: row.closed_at,
@@ -256,7 +446,7 @@ function mapOrderRows(rows) {
       continue;
     }
 
-      orderMap.get(row.id).items.push({
+    orderMap.get(row.id).items.push({
       item_id: row.item_id,
       name: row.item_name || 'Item no disponible',
       description: row.item_description || '',
@@ -268,12 +458,61 @@ function mapOrderRows(rows) {
 
   return Array.from(orderMap.values()).map((order) => ({
     ...order,
-    total_amount: order.items.reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 0)), 0),
-    durations: buildOrderDurations(order),
+    total_amount: roundMoney(order.items.reduce(
+      (sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 0)),
+      0
+    )),
   }));
 }
 
-async function getOrderRows(database, whereClause = '', params = []) {
+function decorateOrderWithPayments(order, payments = [], externalPaymentAttempts = [], suborders = []) {
+  const paymentSummary = summarizeOrderPayments(order, payments);
+  const attemptsSummary = summarizeExternalPaymentAttempts(externalPaymentAttempts);
+  const subordersSummary = summarizeSuborders(suborders);
+  const decoratedOrder = {
+    ...order,
+    payment_received_at: paymentSummary.payment_received_at,
+    payment_method: paymentSummary.primary_method,
+    payments: paymentSummary.payments,
+    amount_paid: paymentSummary.amount_paid,
+    amount_due: paymentSummary.amount_due,
+    payment_status: paymentSummary.payment_status,
+    payments_summary: paymentSummary.payments_summary,
+    external_payment_attempts: externalPaymentAttempts,
+    external_payment_attempts_summary: attemptsSummary,
+    suborders,
+    suborders_summary: subordersSummary,
+  };
+
+  return {
+    ...decoratedOrder,
+    can_close: Boolean(
+      !decoratedOrder.closed_at
+      && decoratedOrder.status === 'delivered'
+      && decoratedOrder.bill_attended_at
+      && decoratedOrder.amount_due <= MONEY_EPSILON
+    ),
+    durations: buildOrderDurations(decoratedOrder),
+  };
+}
+
+async function enrichOrdersWithPayments(database, orders = []) {
+  const orderIds = orders.map((order) => order.id);
+  const [paymentsByOrderId, externalAttemptsByOrderId, subordersByOrderId] = await Promise.all([
+    listPaymentsForOrderIds(database, orderIds),
+    listExternalPaymentAttemptsForOrderIds(database, orderIds),
+    listSubordersForOrderIds(database, orderIds),
+  ]);
+
+  return orders.map((order) => decorateOrderWithPayments(
+    order,
+    paymentsByOrderId.get(order.id) || [],
+    externalAttemptsByOrderId.get(order.id) || [],
+    subordersByOrderId.get(order.id) || []
+  ));
+}
+
+async function getOrderRows(database, whereClause = '', params = [], orderByClause = 'ORDER BY o.created_at DESC, o.id DESC, oi.id ASC') {
   return database.all(
     `
       SELECT
@@ -286,6 +525,8 @@ async function getOrderRows(database, whereClause = '', params = []) {
         o.delivered_at,
         o.bill_requested_at,
         o.bill_attended_at,
+        o.bill_payment_method_preference,
+        o.bill_collection_status,
         o.payment_received_at,
         o.payment_method,
         o.closed_at,
@@ -298,15 +539,32 @@ async function getOrderRows(database, whereClause = '', params = []) {
       FROM orders o
       LEFT JOIN order_items oi ON oi.order_id = o.id
       ${whereClause}
-      ORDER BY o.created_at DESC, o.id DESC, oi.id ASC
+      ${orderByClause}
     `,
     params
   );
 }
 
 async function getOrderById(database, orderId) {
-  const rows = await getOrderRows(database, 'WHERE o.id = ?', [orderId]);
-  return mapOrderRows(rows)[0] || null;
+  const normalizedOrderId = ensurePositiveInteger(orderId, 'order_id');
+  const rows = await getOrderRows(database, 'WHERE o.id = ?', [normalizedOrderId]);
+  const mappedOrder = mapOrderRows(rows)[0] || null;
+
+  if (!mappedOrder) {
+    return null;
+  }
+
+  const [payments, externalAttemptsByOrderId, subordersByOrderId] = await Promise.all([
+    listPaymentsForOrder(database, normalizedOrderId),
+    listExternalPaymentAttemptsForOrderIds(database, [normalizedOrderId]),
+    listSubordersForOrderIds(database, [normalizedOrderId]),
+  ]);
+  return decorateOrderWithPayments(
+    mappedOrder,
+    payments,
+    externalAttemptsByOrderId.get(normalizedOrderId) || [],
+    subordersByOrderId.get(normalizedOrderId) || []
+  );
 }
 
 async function getOrderRecordById(database, orderId) {
@@ -323,6 +581,8 @@ async function getOrderRecordById(database, orderId) {
         delivered_at,
         bill_requested_at,
         bill_attended_at,
+        bill_payment_method_preference,
+        bill_collection_status,
         payment_received_at,
         payment_method,
         closed_at
@@ -335,55 +595,34 @@ async function getOrderRecordById(database, orderId) {
 
 async function listOrders(database) {
   const rows = await getOrderRows(database);
-  return mapOrderRows(rows);
+  return enrichOrdersWithPayments(database, mapOrderRows(rows));
 }
 
 async function listOpenOrders(database) {
   const rows = await getOrderRows(database, 'WHERE o.closed_at IS NULL');
-  return mapOrderRows(rows);
+  return enrichOrdersWithPayments(database, mapOrderRows(rows));
+}
+
+function matchesHistoryPaymentFilter(order, paymentMethod) {
+  if (!paymentMethod) {
+    return true;
+  }
+
+  return order.payment_method === paymentMethod;
 }
 
 async function listClosedOrdersHistory(database, rawFilters = {}) {
   const filters = normalizeHistoryFilters(rawFilters);
-  const { whereClause, params } = buildHistoryWhereClause(filters);
-  const totalRow = await database.get(
-    `
-      SELECT COUNT(*) AS total_count
-      FROM orders o
-      ${whereClause}
-    `,
-    params
+  const { whereClause, params } = buildClosedHistoryWhereClause(filters);
+  const rows = await getOrderRows(
+    database,
+    whereClause,
+    params,
+    'ORDER BY o.closed_at DESC, o.id DESC, oi.id ASC'
   );
 
-  const rows = await database.all(
-    `
-      SELECT
-        o.id,
-        o.table_id,
-        o.status,
-        o.created_at,
-        o.processing_started_at,
-        o.ready_at,
-        o.delivered_at,
-        o.bill_requested_at,
-        o.bill_attended_at,
-        o.payment_received_at,
-        o.payment_method,
-        o.closed_at,
-        oi.item_id,
-        oi.quantity,
-        oi.comments,
-        oi.item_name,
-        oi.item_description,
-        oi.unit_price
-      FROM orders o
-      LEFT JOIN order_items oi ON oi.order_id = o.id
-      ${whereClause}
-      ORDER BY o.closed_at DESC, o.id DESC, oi.id ASC
-      LIMIT ? OFFSET ?
-    `,
-    [...params, filters.limit, filters.offset]
-  );
+  const enrichedOrders = await enrichOrdersWithPayments(database, mapOrderRows(rows));
+  const filteredOrders = enrichedOrders.filter((order) => matchesHistoryPaymentFilter(order, filters.payment_method));
 
   return {
     filters: {
@@ -394,56 +633,29 @@ async function listClosedOrdersHistory(database, rawFilters = {}) {
       offset: filters.offset,
       preset: filters.preset,
     },
-    total_count: totalRow?.total_count || 0,
-    orders: mapOrderRows(rows),
+    total_count: filteredOrders.length,
+    orders: filteredOrders.slice(filters.offset, filters.offset + filters.limit),
   };
 }
 
 async function getClosedOrdersHistorySummary(database, rawFilters = {}) {
   const filters = normalizeHistoryFilters(rawFilters);
-  const { whereClause, params } = buildHistoryWhereClause(filters);
-  const rows = await database.all(
-    `
-      SELECT
-        o.id,
-        o.created_at,
-        o.ready_at,
-        o.delivered_at,
-        o.bill_attended_at,
-        o.payment_received_at,
-        o.payment_method,
-        o.closed_at,
-        COALESCE(SUM(oi.unit_price * oi.quantity), 0) AS total_amount
-      FROM orders o
-      LEFT JOIN order_items oi ON oi.order_id = o.id
-      ${whereClause}
-      GROUP BY
-        o.id,
-        o.created_at,
-        o.ready_at,
-        o.delivered_at,
-        o.bill_attended_at,
-        o.payment_received_at,
-        o.payment_method,
-        o.closed_at
-      ORDER BY o.closed_at DESC, o.id DESC
-    `,
-    params
+  const { whereClause, params } = buildClosedHistoryWhereClause(filters);
+  const rows = await getOrderRows(
+    database,
+    whereClause,
+    params,
+    'ORDER BY o.closed_at DESC, o.id DESC, oi.id ASC'
   );
 
-  const summaryRows = rows.map((row) => ({
-    total_amount: Number(row.total_amount || 0),
-    payment_method: row.payment_method || 'unknown',
-    prep_minutes: calculateDurationMinutes(row.created_at, row.ready_at),
-    service_minutes: calculateDurationMinutes(row.created_at, row.delivered_at),
-    to_payment_minutes: calculateDurationMinutes(row.created_at, row.payment_received_at),
-  }));
+  const orders = (await enrichOrdersWithPayments(database, mapOrderRows(rows)))
+    .filter((order) => matchesHistoryPaymentFilter(order, filters.payment_method));
 
-  const totalRevenue = summaryRows.reduce((sum, row) => sum + row.total_amount, 0);
+  const totalRevenue = roundMoney(orders.reduce((sum, order) => sum + Number(order.total_amount || 0), 0));
   const paymentBreakdownMap = new Map();
 
-  for (const row of summaryRows) {
-    const bucketKey = row.payment_method;
+  for (const order of orders) {
+    const bucketKey = order.payment_method || 'unknown';
     const currentBucket = paymentBreakdownMap.get(bucketKey) || {
       payment_method: bucketKey,
       orders_count: 0,
@@ -451,13 +663,11 @@ async function getClosedOrdersHistorySummary(database, rawFilters = {}) {
     };
 
     currentBucket.orders_count += 1;
-    currentBucket.total_revenue += row.total_amount;
+    currentBucket.total_revenue = roundMoney(currentBucket.total_revenue + Number(order.total_amount || 0));
     paymentBreakdownMap.set(bucketKey, currentBucket);
   }
 
-  const paymentMethodOrder = ['cash', 'card', 'transfer', 'other', 'unknown'];
-  const payment_breakdown = Array.from(paymentBreakdownMap.values())
-    .sort((left, right) => paymentMethodOrder.indexOf(left.payment_method) - paymentMethodOrder.indexOf(right.payment_method));
+  const paymentMethodOrder = ['cash', 'card', 'transfer', 'other', 'mercado_pago', 'split', 'unknown'];
 
   return {
     filters: {
@@ -467,18 +677,20 @@ async function getClosedOrdersHistorySummary(database, rawFilters = {}) {
       preset: filters.preset,
     },
     summary: {
-      orders_count: summaryRows.length,
-      total_revenue: Number(totalRevenue.toFixed(2)),
-      average_ticket: summaryRows.length > 0 ? Number((totalRevenue / summaryRows.length).toFixed(2)) : 0,
-      average_prep_minutes: average(summaryRows.map((row) => row.prep_minutes)),
-      average_service_minutes: average(summaryRows.map((row) => row.service_minutes)),
-      average_to_payment_minutes: average(summaryRows.map((row) => row.to_payment_minutes)),
+      orders_count: orders.length,
+      total_revenue: totalRevenue,
+      average_ticket: orders.length > 0 ? roundMoney(totalRevenue / orders.length) : 0,
+      average_prep_minutes: average(orders.map((order) => order?.durations?.prep_minutes)),
+      average_service_minutes: average(orders.map((order) => order?.durations?.service_minutes)),
+      average_to_payment_minutes: average(orders.map((order) => order?.durations?.to_payment_minutes)),
     },
-    payment_breakdown,
+    payment_breakdown: Array.from(paymentBreakdownMap.values()).sort(
+      (left, right) => paymentMethodOrder.indexOf(left.payment_method) - paymentMethodOrder.indexOf(right.payment_method)
+    ),
   };
 }
 
-async function getActiveOrderForTable(database, tableId) {
+async function getActiveOrderIdForTable(database, tableId) {
   const normalizedTableId = ensurePositiveInteger(tableId, 'table_id');
   const activeOrder = await database.get(
     `
@@ -492,11 +704,12 @@ async function getActiveOrderForTable(database, tableId) {
     [normalizedTableId]
   );
 
-  if (!activeOrder) {
-    return null;
-  }
+  return activeOrder?.id || null;
+}
 
-  return getOrderById(database, activeOrder.id);
+async function getActiveOrderForTable(database, tableId) {
+  const activeOrderId = await getActiveOrderIdForTable(database, tableId);
+  return activeOrderId ? getOrderById(database, activeOrderId) : null;
 }
 
 async function getLatestOrderForTable(database, tableId) {
@@ -512,11 +725,7 @@ async function getLatestOrderForTable(database, tableId) {
     [normalizedTableId]
   );
 
-  if (!latestOrder) {
-    return null;
-  }
-
-  return getOrderById(database, latestOrder.id);
+  return latestOrder?.id ? getOrderById(database, latestOrder.id) : null;
 }
 
 async function getOrderSessionForTable(database, tableId) {
@@ -543,92 +752,23 @@ async function ensureSingleOpenOrderForTable(database, tableId) {
   }
 }
 
-async function resolveActiveMenuItems(database, items) {
-  const uniqueItemIds = [...new Set(items.map((item) => item.item_id))];
-  const placeholders = uniqueItemIds.map(() => '?').join(', ');
-
-  const rows = await database.all(
-    `
-      SELECT
-        mi.id AS item_id,
-        mi.name,
-        mi.description,
-        mi.price,
-        mi.is_available
-      FROM menu_items mi
-      INNER JOIN menu_categories mc ON mc.id = mi.category_id
-      INNER JOIN menus m ON m.id = mc.menu_id
-      WHERE m.is_active = 1
-        AND mi.id IN (${placeholders})
-    `,
-    uniqueItemIds
-  );
-
-  if (rows.length !== uniqueItemIds.length) {
-    throw createOrderError(
-      'INVALID_ORDER_ITEM',
-      'One or more item_id values are invalid for the active menu'
-    );
-  }
-
-  const unavailableItems = rows.filter((row) => Number(row.is_available) === 0);
-
-  if (unavailableItems.length > 0) {
-    throw createOrderError(
-      'ITEM_UNAVAILABLE',
-      'Uno o más productos ya no están disponibles.',
-      409,
-      {
-        unavailable_items: unavailableItems.map((item) => ({
-          item_id: item.item_id,
-          name: item.name,
-        })),
-      }
-    );
-  }
-
-  return new Map(rows.map((row) => [row.item_id, row]));
-}
-
 async function createOrder(database, payload) {
   const normalizedPayload = normalizeOrderPayload(payload);
   try {
     return await database.withTransaction(async () => {
       await ensureSingleOpenOrderForTable(database, normalizedPayload.table_id);
-      const activeMenuItems = await resolveActiveMenuItems(database, normalizedPayload.items);
 
       const orderResult = await database.run(
         `INSERT INTO orders (table_id, status) VALUES (?, 'pending')`,
         [normalizedPayload.table_id]
       );
 
-      for (const item of normalizedPayload.items) {
-        const menuItem = activeMenuItems.get(item.item_id);
-
-        await database.run(
-          `
-            INSERT INTO order_items (
-              order_id,
-              item_id,
-              quantity,
-              comments,
-              item_name,
-              item_description,
-              unit_price
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-          `,
-          [
-            orderResult.lastID,
-            item.item_id,
-            item.quantity,
-            item.comments,
-            menuItem.name,
-            menuItem.description || '',
-            menuItem.price
-          ]
-        );
-      }
+      await createInitialSuborderForOrder(
+        database,
+        orderResult.lastID,
+        normalizedPayload.table_id,
+        normalizedPayload.items
+      );
 
       return getOrderById(database, orderResult.lastID);
     });
@@ -643,7 +783,6 @@ async function createOrder(database, payload) {
 
 async function updateOrderStatus(database, orderId, status) {
   const normalizedOrderId = ensurePositiveInteger(orderId, 'order_id');
-
   if (!VALID_ORDER_STATUSES.has(status)) {
     throw createOrderError('INVALID_ORDER_STATUS', 'status is invalid');
   }
@@ -658,56 +797,112 @@ async function updateOrderStatus(database, orderId, status) {
     throw createOrderError('ORDER_ALREADY_CLOSED', 'La mesa ya fue cerrada para este pedido.', 409);
   }
 
-  const updateStatements = {
-    processing: `
-      UPDATE orders
-      SET
-        status = ?,
-        processing_started_at = COALESCE(processing_started_at, CURRENT_TIMESTAMP)
-      WHERE id = ?
-    `,
-    ready: `
-      UPDATE orders
-      SET
-        status = ?,
-        processing_started_at = COALESCE(processing_started_at, CURRENT_TIMESTAMP),
-        ready_at = COALESCE(ready_at, CURRENT_TIMESTAMP)
-      WHERE id = ?
-    `,
-    delivered: `
-      UPDATE orders
-      SET
-        status = ?,
-        processing_started_at = COALESCE(processing_started_at, CURRENT_TIMESTAMP),
-        ready_at = COALESCE(ready_at, CURRENT_TIMESTAMP),
-        delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP)
-      WHERE id = ?
-    `
-  };
+  const suborders = await listSubordersForOrder(database, normalizedOrderId);
+  const nextSuborder = [...suborders]
+    .filter((suborder) => suborder.status !== 'cancelled')
+    .sort((left, right) => {
+      const leftTime = Date.parse(left.created_at || '') || 0;
+      const rightTime = Date.parse(right.created_at || '') || 0;
+      return rightTime - leftTime || right.id - left.id;
+    })[0];
 
-  const updateResult = await database.run(
-    updateStatements[status] || 'UPDATE orders SET status = ? WHERE id = ?',
-    [status, normalizedOrderId]
+  if (!nextSuborder) {
+    throw createOrderError('SUBORDER_NOT_FOUND', 'No encontramos un subpedido operativo para actualizar.', 404);
+  }
+
+  const updatedSuborder = await updateSuborderStatus(database, nextSuborder.id, status);
+  const nextOrder = await getOrderById(database, normalizedOrderId);
+
+  return {
+    order: nextOrder,
+    suborder: updatedSuborder,
+  };
+}
+
+async function syncBillCollectionStateForOrder(database, orderId) {
+  const normalizedOrderId = ensurePositiveInteger(orderId, 'order_id');
+  const order = await getOrderById(database, normalizedOrderId);
+
+  if (!order) {
+    return null;
+  }
+
+  const nextStatus = computeBillCollectionStatus(order);
+  const nextPreferredMethod = order.bill_requested_at
+    ? normalizeBillPaymentMethodPreference(order.bill_payment_method_preference, { allowNull: true })
+    : null;
+
+  if (
+    nextStatus === normalizeBillCollectionStatus(order.bill_collection_status)
+    && nextPreferredMethod === normalizeBillPaymentMethodPreference(order.bill_payment_method_preference, { allowNull: true })
+  ) {
+    return order;
+  }
+
+  await database.run(
+    `
+      UPDATE orders
+      SET
+        bill_payment_method_preference = ?,
+        bill_collection_status = ?
+      WHERE id = ?
+    `,
+    [nextPreferredMethod, nextStatus, normalizedOrderId]
   );
 
   return getOrderById(database, normalizedOrderId);
 }
 
-async function markBillRequestedForTable(database, tableId) {
+async function syncOrderFinancialStateAfterLedgerChange(database, orderId) {
+  await syncLegacyPaymentFieldsForOrder(database, orderId);
+  return syncBillCollectionStateForOrder(database, orderId);
+}
+
+async function markBillRequestedForTable(database, tableId, preferredPaymentMethod = 'cash') {
   const activeOrder = await getActiveOrderForTable(database, tableId);
 
   if (!activeOrder) {
     throw createOrderError('NO_OPEN_ORDER', 'No hay un pedido abierto para pedir la cuenta.', 409);
   }
 
+  if (activeOrder.closed_at) {
+    throw createOrderError('ORDER_ALREADY_CLOSED', 'La mesa ya fue cerrada para este pedido.', 409);
+  }
+
+  if (activeOrder.status !== 'delivered') {
+    throw createOrderError('ORDER_NOT_DELIVERED', 'El pedido todavía no fue entregado.', 409);
+  }
+
+  if (Number(activeOrder.amount_due || 0) <= MONEY_EPSILON) {
+    throw createOrderError('ORDER_ALREADY_PAID', 'El pedido ya quedó completamente saldado.', 409);
+  }
+
+  const normalizedPreferredMethod = normalizeBillPaymentMethodPreference(preferredPaymentMethod);
+  const shouldAutoAttend = normalizedPreferredMethod === 'mercado_pago';
+  const nextStatus = computeBillCollectionStatus({
+    ...activeOrder,
+    bill_requested_at: activeOrder.bill_requested_at || new Date().toISOString(),
+    bill_attended_at: shouldAutoAttend
+      ? (activeOrder.bill_attended_at || new Date().toISOString())
+      : activeOrder.bill_attended_at,
+    bill_payment_method_preference: normalizedPreferredMethod,
+  });
+
   await database.run(
     `
       UPDATE orders
-      SET bill_requested_at = COALESCE(bill_requested_at, CURRENT_TIMESTAMP)
+      SET
+        bill_requested_at = COALESCE(bill_requested_at, CURRENT_TIMESTAMP),
+        bill_attended_at = CASE
+          WHEN ? = 1 THEN COALESCE(bill_attended_at, CURRENT_TIMESTAMP)
+          ELSE bill_attended_at
+        END,
+        bill_payment_method_preference = ?,
+        bill_collection_status = ?
       WHERE id = ?
         AND closed_at IS NULL
     `,
-    [activeOrder.id]
+    [shouldAutoAttend ? 1 : 0, normalizedPreferredMethod, nextStatus, activeOrder.id]
   );
 
   return getOrderById(database, activeOrder.id);
@@ -723,7 +918,11 @@ async function clearBillRequestedForTable(database, tableId) {
   await database.run(
     `
       UPDATE orders
-      SET bill_requested_at = NULL
+      SET
+        bill_requested_at = NULL,
+        bill_attended_at = NULL,
+        bill_payment_method_preference = NULL,
+        bill_collection_status = NULL
       WHERE id = ?
         AND closed_at IS NULL
         AND bill_attended_at IS NULL
@@ -745,59 +944,236 @@ async function markBillAttendedForTable(database, tableId) {
     throw createOrderError('ORDER_NOT_DELIVERED', 'El pedido todavía no fue entregado.', 409);
   }
 
-  if (activeOrder.payment_received_at) {
-    throw createOrderError('PAYMENT_ALREADY_RECORDED', 'El pago ya fue registrado para esta mesa.', 409);
-  }
-
   await database.run(
     `
       UPDATE orders
       SET
         bill_requested_at = COALESCE(bill_requested_at, CURRENT_TIMESTAMP),
-        bill_attended_at = COALESCE(bill_attended_at, CURRENT_TIMESTAMP)
+        bill_attended_at = COALESCE(bill_attended_at, CURRENT_TIMESTAMP),
+        bill_collection_status = ?
       WHERE id = ?
         AND closed_at IS NULL
     `,
-    [activeOrder.id]
+    [
+      computeBillCollectionStatus({
+        ...activeOrder,
+        bill_requested_at: activeOrder.bill_requested_at || new Date().toISOString(),
+        bill_attended_at: activeOrder.bill_attended_at || new Date().toISOString(),
+      }),
+      activeOrder.id,
+    ]
   );
 
   return getOrderById(database, activeOrder.id);
 }
 
-async function markPaymentReceivedForTable(database, tableId, paymentMethod) {
-  const normalizedPaymentMethod = normalizePaymentMethod(paymentMethod);
+async function syncLegacyPaymentFieldsForOrder(database, orderId) {
+  const order = await getOrderById(database, orderId);
+
+  if (!order) {
+    return null;
+  }
+
+  if (order.payment_status !== 'paid') {
+    return order;
+  }
+
+  const nonLegacyPayments = (order.payments || []).filter((payment) => !payment.legacy);
+  const uniqueMethods = [...new Set(nonLegacyPayments.map((payment) => payment.method).filter(Boolean))];
+  const legacyCompatibleMethod = uniqueMethods.length === 1 && LEGACY_ORDER_PAYMENT_METHODS.has(uniqueMethods[0])
+    ? uniqueMethods[0]
+    : null;
+
+  await database.run(
+    `
+      UPDATE orders
+      SET
+        payment_received_at = COALESCE(payment_received_at, ?),
+        payment_method = ?
+      WHERE id = ?
+    `,
+    [order.payment_received_at || new Date().toISOString(), legacyCompatibleMethod, orderId]
+  );
+
+  return getOrderById(database, orderId);
+}
+
+async function createOrderPayment(database, orderId, payload = {}, options = {}) {
+  const normalizedOrderId = ensurePositiveInteger(orderId, 'order_id');
+  const order = await getOrderById(database, normalizedOrderId);
+
+  if (!order) {
+    throw createOrderError('ORDER_NOT_FOUND', 'No encontramos ese pedido.', 404);
+  }
+
+  if (order.closed_at) {
+    throw createOrderError('ORDER_ALREADY_CLOSED', 'La mesa ya fue cerrada para este pedido.', 409);
+  }
+
+  if (order.status !== 'delivered') {
+    throw createOrderError('ORDER_NOT_DELIVERED', 'El pedido todavía no fue entregado.', 409);
+  }
+
+  if (!order.bill_attended_at) {
+    throw createOrderError('BILL_NOT_ATTENDED', 'La cuenta todavía no fue entregada.', 409);
+  }
+
+  const method = normalizePaymentMethod(payload?.method);
+  const { amount } = validatePaymentAgainstOrder(order, order.payments, payload?.amount);
+  const openRegister = await getOpenRegister(database);
+
+  if (method === 'cash' && !openRegister) {
+    throw createOrderError('OPEN_CASH_REGISTER_REQUIRED', 'Necesitás una caja abierta para registrar pagos en efectivo.', 409);
+  }
+
+  await createPaymentRecord(database, {
+    order_id: normalizedOrderId,
+    cash_register_session_id: openRegister?.id || null,
+    amount,
+    method,
+    note: payload?.note,
+    created_by: options.created_by || null,
+  });
+
+  return syncOrderFinancialStateAfterLedgerChange(database, normalizedOrderId);
+}
+
+async function listOrderPayments(database, orderId) {
+  const order = await getOrderById(database, orderId);
+
+  if (!order) {
+    throw createOrderError('ORDER_NOT_FOUND', 'No encontramos ese pedido.', 404);
+  }
+
+  return order.payments || [];
+}
+
+async function getOrderPaymentSummary(database, orderId) {
+  const order = await getOrderById(database, orderId);
+
+  if (!order) {
+    throw createOrderError('ORDER_NOT_FOUND', 'No encontramos ese pedido.', 404);
+  }
+
+  return {
+    order_id: order.id,
+    total_amount: order.total_amount,
+    amount_paid: order.amount_paid,
+    amount_due: order.amount_due,
+    payment_status: order.payment_status,
+    bill_payment_method_preference: order.bill_payment_method_preference,
+    bill_collection_status: order.bill_collection_status,
+    payments_summary: order.payments_summary,
+    payments: order.payments,
+    external_payment_attempts: order.external_payment_attempts,
+    external_payment_attempts_summary: order.external_payment_attempts_summary,
+  };
+}
+
+async function reverseOrderPayment(database, orderId, paymentId, payload = {}, options = {}) {
+  const normalizedOrderId = ensurePositiveInteger(orderId, 'order_id');
+  const normalizedPaymentId = ensurePositiveInteger(paymentId, 'payment_id');
+  const order = await getOrderById(database, normalizedOrderId);
+
+  if (!order) {
+    throw createOrderError('ORDER_NOT_FOUND', 'No encontramos ese pedido.', 404);
+  }
+
+  if (order.closed_at) {
+    throw createOrderError('ORDER_ALREADY_CLOSED', 'No se pueden revertir pagos de una mesa ya cerrada.', 409);
+  }
+
+  const payment = (order.payments || []).find((entry) => entry.id === normalizedPaymentId);
+
+  if (!payment) {
+    throw createOrderError('ORDER_PAYMENT_NOT_FOUND', 'No encontramos ese pago dentro del pedido.', 404);
+  }
+
+  const { amount } = validatePaymentReversalAgainstPayment(payment, payload?.amount);
+  const openRegister = await getOpenRegister(database);
+
+  if (payment.method === 'cash' && !openRegister) {
+    throw createOrderError(
+      'OPEN_CASH_REGISTER_REQUIRED',
+      'Necesitás una caja abierta para revertir pagos en efectivo.',
+      409
+    );
+  }
+
+  await createPaymentReversalRecord(database, {
+    order_payment_id: normalizedPaymentId,
+    order_id: normalizedOrderId,
+    cash_register_session_id: openRegister?.id || null,
+    amount,
+    reason: payload?.reason,
+    created_by: options.created_by || null,
+  });
+
+  return syncBillCollectionStateForOrder(database, normalizedOrderId);
+}
+
+async function markPaymentReceivedForTable(database, tableId, paymentMethod, options = {}) {
   const activeOrder = await getActiveOrderForTable(database, tableId);
 
   if (!activeOrder) {
     throw createOrderError('NO_OPEN_ORDER', 'No hay un pedido abierto para registrar el cobro.', 404);
   }
 
-  if (activeOrder.status !== 'delivered') {
+  if (activeOrder.amount_due <= MONEY_EPSILON) {
+    throw createOrderError('ORDER_ALREADY_PAID', 'El pedido ya quedó completamente saldado.', 409);
+  }
+
+  return createOrderPayment(database, activeOrder.id, {
+    amount: activeOrder.amount_due,
+    method: paymentMethod,
+    note: options.note || '',
+  }, options);
+}
+
+async function validateOrderClose(order) {
+  if (!order) {
+    throw createOrderError('ORDER_NOT_FOUND', 'No encontramos ese pedido.', 404);
+  }
+
+  if (order.closed_at) {
+    throw createOrderError('ORDER_ALREADY_CLOSED', 'La mesa ya fue cerrada para este pedido.', 409);
+  }
+
+  if (order.status !== 'delivered') {
     throw createOrderError('ORDER_NOT_DELIVERED', 'El pedido todavía no fue entregado.', 409);
   }
 
-  if (!activeOrder.bill_attended_at) {
+  if (!order.bill_attended_at) {
     throw createOrderError('BILL_NOT_ATTENDED', 'La cuenta todavía no fue entregada.', 409);
   }
 
-  if (activeOrder.payment_received_at) {
-    throw createOrderError('PAYMENT_ALREADY_RECORDED', 'El pago ya fue registrado para esta mesa.', 409);
+  if (order.amount_due > MONEY_EPSILON) {
+    throw createOrderError(
+      'ORDER_BALANCE_PENDING',
+      `Todavía queda un saldo pendiente de ${order.amount_due.toFixed(2)}.`,
+      409,
+      { amount_due: order.amount_due }
+    );
   }
+}
+
+async function closeOrderById(database, orderId) {
+  const normalizedOrderId = ensurePositiveInteger(orderId, 'order_id');
+  const order = await getOrderById(database, normalizedOrderId);
+
+  await validateOrderClose(order);
 
   await database.run(
     `
       UPDATE orders
-      SET
-        payment_received_at = COALESCE(payment_received_at, CURRENT_TIMESTAMP),
-        payment_method = COALESCE(payment_method, ?),
-        closed_at = COALESCE(closed_at, CURRENT_TIMESTAMP)
+      SET closed_at = COALESCE(closed_at, CURRENT_TIMESTAMP)
       WHERE id = ?
         AND closed_at IS NULL
     `,
-    [normalizedPaymentMethod, activeOrder.id]
+    [normalizedOrderId]
   );
 
-  return getOrderById(database, activeOrder.id);
+  return getOrderById(database, normalizedOrderId);
 }
 
 async function closeOpenOrderForTable(database, tableId) {
@@ -807,48 +1183,35 @@ async function closeOpenOrderForTable(database, tableId) {
     throw createOrderError('NO_OPEN_ORDER', 'No hay un pedido abierto para cerrar esta mesa.', 404);
   }
 
-  if (activeOrder.status !== 'delivered') {
-    throw createOrderError('ORDER_NOT_DELIVERED', 'El pedido todavía no fue entregado.', 409);
-  }
-
-  if (!activeOrder.bill_attended_at) {
-    throw createOrderError('BILL_NOT_ATTENDED', 'La cuenta todavía no fue entregada.', 409);
-  }
-
-  if (!activeOrder.payment_received_at) {
-    throw createOrderError('PAYMENT_NOT_RECEIVED', 'El pago todavía no fue registrado.', 409);
-  }
-
-  await database.run(
-    `
-      UPDATE orders
-      SET closed_at = COALESCE(closed_at, CURRENT_TIMESTAMP)
-      WHERE id = ?
-        AND closed_at IS NULL
-    `,
-    [activeOrder.id]
-  );
-
-  return getOrderById(database, activeOrder.id);
+  return closeOrderById(database, activeOrder.id);
 }
 
 module.exports = {
   ACTIVE_ORDER_STATUSES,
+  VALID_BILL_PAYMENT_METHOD_PREFERENCES,
   VALID_ORDER_STATUSES,
   clearBillRequestedForTable,
   closeOpenOrderForTable,
+  closeOrderById,
   createOrder,
   createOrderError,
+  createOrderPayment,
   getActiveOrderForTable,
-  getLatestOrderForTable,
   getClosedOrdersHistorySummary,
-  getOrderSessionForTable,
+  getLatestOrderForTable,
   getOrderById,
+  getOrderPaymentSummary,
+  getOrderSessionForTable,
   listClosedOrdersHistory,
   listOpenOrders,
+  listOrderPayments,
   listOrders,
   markBillAttendedForTable,
   markBillRequestedForTable,
   markPaymentReceivedForTable,
+  normalizeBillPaymentMethodPreference,
+  reverseOrderPayment,
+  syncBillCollectionStateForOrder,
+  syncOrderFinancialStateAfterLedgerChange,
   updateOrderStatus
 };

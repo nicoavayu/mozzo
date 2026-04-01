@@ -277,7 +277,7 @@ async function main() {
       const payment = await requestJson(`${baseUrl}/api/tables/21/payment`, {
         method: 'POST',
         headers: authHeaders(adminToken, true),
-        body: JSON.stringify({ payment_method: 'cash' }),
+        body: JSON.stringify({ payment_method: 'transfer' }),
       });
       assert.equal(payment.response.status, 200);
       await paymentRecorded;
@@ -297,7 +297,27 @@ async function main() {
       });
       assert.equal(openOrdersAfterPayment.response.status, 200);
       assert.ok(openOrdersAfterPayment.body.some((order) => order.id === secondOrder.body.id));
-      assert.ok(openOrdersAfterPayment.body.every((order) => order.id !== orderId));
+      assert.ok(openOrdersAfterPayment.body.some((order) => order.id === orderId));
+      assert.ok(openOrdersAfterPayment.body.every((order) => !order.closed_at));
+
+      const closedOrder = waitForSocketEvent(
+        adminSocket,
+        'order_updated',
+        (order) => order?.id === orderId && Boolean(order?.closed_at)
+      );
+      const closeResponse = await requestJson(`${baseUrl}/api/admin/orders/${orderId}/close`, {
+        method: 'POST',
+        headers: authHeaders(adminToken),
+      });
+      assert.equal(closeResponse.response.status, 200);
+      await closedOrder;
+
+      const openOrdersAfterClose = await requestJson(`${baseUrl}/api/admin/orders/open`, {
+        headers: authHeaders(adminToken),
+      });
+      assert.equal(openOrdersAfterClose.response.status, 200);
+      assert.ok(openOrdersAfterClose.body.some((order) => order.id === secondOrder.body.id));
+      assert.ok(openOrdersAfterClose.body.every((order) => order.id !== orderId));
 
       const history = await requestJson(`${baseUrl}/api/admin/orders/history?preset=today`, {
         headers: authHeaders(adminToken),

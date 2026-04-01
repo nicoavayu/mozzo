@@ -9,6 +9,8 @@ export const HISTORY_PAYMENT_METHOD_OPTIONS = [
   { value: 'card', label: 'Tarjeta' },
   { value: 'transfer', label: 'Transferencia' },
   { value: 'other', label: 'Otro' },
+  { value: 'mercado_pago', label: 'Mercado Pago' },
+  { value: 'split', label: 'Pago dividido' },
 ];
 
 export const DEFAULT_HISTORY_FILTERS = Object.freeze({
@@ -75,6 +77,10 @@ export function formatHistoryPaymentMethod(value) {
       return 'Transferencia';
     case 'other':
       return 'Otro';
+    case 'mercado_pago':
+      return 'Mercado Pago';
+    case 'split':
+      return 'Pago dividido';
     default:
       return 'Sin registrar';
   }

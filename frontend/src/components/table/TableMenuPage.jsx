@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowLeft, CheckCircle, ChevronLeft, ChevronRight, ClipboardList, Plus, Search } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Plus, Search } from 'lucide-react';
 import { Link, useOutletContext } from 'react-router-dom';
 import { formatMoney } from '../../hooks/useTableSession';
+import FloatingOrderDock from './FloatingOrderDock';
+import OrderConfirmedModal from './OrderConfirmedModal';
 
 function categoryDomId(categoryName, index) {
   return `category-${index}-${String(categoryName || '')
@@ -26,14 +28,18 @@ export default function TableMenuPage() {
     menuAvailabilityFeedback,
     cart,
     activeOrder,
+    activeOrderItemsCount,
     isDraftLocked,
     draftLockedReason,
     addToCart,
+    updateQuantity,
     reloadSession,
     orderConfirmed,
+    clearOrderConfirmed,
   } = useOutletContext();
 
   const [searchQuery, setSearchQuery] = useState('');
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [activeCategoryId, setActiveCategoryId] = useState('');
   const searchShellRef = useRef(null);
   const categoryBarRef = useRef(null);
@@ -191,19 +197,6 @@ export default function TableMenuPage() {
         '--table-menu-anchor-offset': `${stickyMetrics.anchorOffset}px`,
       }}
     >
-      <section className="table-page-head glass-panel">
-        <Link className="btn" to={`/${tableId}`}>
-          <ArrowLeft size={16} /> Inicio
-        </Link>
-        <div className="table-page-head-copy">
-          <strong>Explorar menú</strong>
-          <span>Platos ordenados por categoría</span>
-        </div>
-        <Link className="btn" to={`/${tableId}/pedido`}>
-          <ClipboardList size={16} /> Mi pedido
-        </Link>
-      </section>
-
       {menuStatus === 'error' && !hasMenuItems && (
         <div className="glass-panel status-card status-card-error">
           <div>
@@ -240,10 +233,101 @@ export default function TableMenuPage() {
         </div>
       )}
 
+      {hasVisibleMenuItems && (
+        <section ref={searchShellRef} className="table-menu-sticky-stack">
+          <div
+            className={[
+              'category-chip-shell',
+              categoryScrollState.canScrollLeft ? 'has-scroll-left' : '',
+              categoryScrollState.canScrollRight ? 'has-scroll-right' : '',
+            ].filter(Boolean).join(' ')}
+          >
+            {categoryScrollState.canScrollLeft && (
+              <button
+                className="category-chip-scroll category-chip-scroll-left"
+                type="button"
+                onClick={() => scrollCategoryBar(-1)}
+                aria-label="Ver categorías anteriores"
+              >
+                <ChevronLeft size={18} />
+              </button>
+            )}
+            <div
+              ref={categoryBarRef}
+              className="category-chip-bar"
+              onScroll={handleCategoryBarScroll}
+            >
+              {filteredCategories.map((category, index) => (
+                <button
+                  key={categoryDomId(category.name, index)}
+                  className={`category-chip ${activeCategoryId === categoryDomId(category.name, index) ? 'is-active' : ''}`}
+                  onClick={() => {
+                    setActiveCategoryId(categoryDomId(category.name, index));
+                    scrollToCategory(category.name, index);
+                  }}
+                >
+                  <span>{category.name}</span>
+                  <span className="category-chip-count">{(category.items || []).length}</span>
+                </button>
+              ))}
+              <button
+                className={`category-chip category-chip-search ${(isSearchOpen || normalizedSearch) ? 'is-active' : ''}`}
+                type="button"
+                onClick={() => setIsSearchOpen((current) => !current)}
+                aria-label={(isSearchOpen || normalizedSearch) ? 'Ocultar búsqueda' : 'Buscar platos'}
+                title={(isSearchOpen || normalizedSearch) ? 'Ocultar búsqueda' : 'Buscar platos'}
+              >
+                <Search size={16} />
+              </button>
+            </div>
+            {categoryScrollState.canScrollRight && (
+              <button
+                className="category-chip-scroll category-chip-scroll-right"
+                type="button"
+                onClick={() => scrollCategoryBar(1)}
+                aria-label="Ver más categorías"
+              >
+                <ChevronRight size={18} />
+              </button>
+            )}
+          </div>
+
+          {(isSearchOpen || normalizedSearch) && (
+            <section className="menu-search-shell glass-panel table-menu-search">
+              <label className="menu-search-box">
+                <Search size={18} />
+                <input
+                  value={searchQuery}
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                  placeholder="Buscar platos, ingredientes o categorías"
+                />
+              </label>
+              <div className="menu-search-meta">
+                <span>{hasVisibleMenuItems
+                  ? `${filteredCategories.reduce((total, category) => total + category.items.length, 0)} platos visibles`
+                  : 'Sin resultados'}</span>
+                {normalizedSearch && (
+                  <button
+                    className="btn"
+                    type="button"
+                    onClick={() => {
+                      setSearchQuery('');
+                      setIsSearchOpen(false);
+                    }}
+                  >
+                    Limpiar
+                  </button>
+                )}
+              </div>
+            </section>
+          )}
+        </section>
+      )}
+
       {isDraftLocked && (
-        <div className="glass-panel status-card">
+        <div className="glass-panel status-card table-inline-note">
           <div>
-            <strong>La mesa ya tiene un pedido abierto.</strong>
+            <strong>No se pueden agregar más pedidos.</strong>
             <span>{draftLockedReason}</span>
           </div>
           <Link className="btn" to={`/${tableId}/pedido`}>
@@ -258,81 +342,6 @@ export default function TableMenuPage() {
             <strong>Actualizamos tu pedido.</strong>
             <span>{menuAvailabilityFeedback}</span>
           </div>
-        </div>
-      )}
-
-      {hasMenuItems && (
-        <section ref={searchShellRef} className="menu-search-shell glass-panel table-menu-search">
-          <label className="menu-search-box">
-            <Search size={18} />
-            <input
-              value={searchQuery}
-              onChange={(event) => setSearchQuery(event.target.value)}
-              placeholder="Buscar platos, ingredientes o categorías"
-            />
-          </label>
-          <div className="menu-search-meta">
-            <span>
-              {hasVisibleMenuItems
-                ? `${filteredCategories.reduce((total, category) => total + category.items.length, 0)} platos visibles`
-                : 'Sin resultados'}
-            </span>
-            {normalizedSearch && (
-              <button className="btn" type="button" onClick={() => setSearchQuery('')}>
-                Limpiar
-              </button>
-            )}
-          </div>
-        </section>
-      )}
-
-      {hasVisibleMenuItems && (
-        <div
-          className={[
-            'category-chip-shell',
-            categoryScrollState.canScrollLeft ? 'has-scroll-left' : '',
-            categoryScrollState.canScrollRight ? 'has-scroll-right' : '',
-          ].filter(Boolean).join(' ')}
-        >
-          {categoryScrollState.canScrollLeft && (
-            <button
-              className="category-chip-scroll category-chip-scroll-left"
-              type="button"
-              onClick={() => scrollCategoryBar(-1)}
-              aria-label="Ver categorías anteriores"
-            >
-              <ChevronLeft size={18} />
-            </button>
-          )}
-          <div
-            ref={categoryBarRef}
-            className="category-chip-bar"
-            onScroll={handleCategoryBarScroll}
-          >
-            {filteredCategories.map((category, index) => (
-              <button
-                key={categoryDomId(category.name, index)}
-                className={`category-chip ${activeCategoryId === categoryDomId(category.name, index) ? 'is-active' : ''}`}
-                onClick={() => {
-                  setActiveCategoryId(categoryDomId(category.name, index));
-                  scrollToCategory(category.name, index);
-                }}
-              >
-                <span>{category.name}</span>
-                <span className="category-chip-count">{(category.items || []).length}</span>
-              </button>
-            ))}
-          </div>
-          {categoryScrollState.canScrollRight && (
-            <button
-              className="category-chip-scroll category-chip-scroll-right"
-              type="button"
-              onClick={() => scrollCategoryBar(1)}
-              aria-label="Ver más categorías"
-            >
-              <ChevronRight size={18} />
-            </button>
-          )}
         </div>
       )}
 
@@ -396,14 +405,38 @@ export default function TableMenuPage() {
                       </div>
 
                       <div className="menu-card-actions">
-                        <button
-                          className="btn btn-primary menu-add-btn"
-                          type="button"
-                          onClick={() => addToCart(item)}
-                          disabled={isDraftLocked || isUnavailable}
-                        >
-                          <Plus size={16} /> {isUnavailable ? 'No disponible' : isDraftLocked ? 'Pedido abierto' : draftQuantity > 0 ? 'Sumar otro' : 'Agregar'}
-                        </button>
+                        {draftQuantity > 0 ? (
+                          <div className="menu-card-quantity-actions">
+                            <div className="qty-controls menu-card-qty-controls">
+                              <button
+                                className="qty-btn"
+                                type="button"
+                                onClick={() => updateQuantity(item.id, -1)}
+                              >
+                                -
+                              </button>
+                              <span className="qty-display">{draftQuantity}</span>
+                              <button
+                                className="qty-btn"
+                                type="button"
+                                onClick={() => addToCart(item)}
+                                disabled={isDraftLocked || isUnavailable}
+                              >
+                                +
+                              </button>
+                            </div>
+                            <span className="menu-card-draft-note">En borrador</span>
+                          </div>
+                        ) : (
+                          <button
+                            className="btn btn-primary menu-add-btn"
+                            type="button"
+                            onClick={() => addToCart(item)}
+                            disabled={isDraftLocked || isUnavailable}
+                          >
+                            <Plus size={16} /> {isUnavailable ? 'No disponible' : isDraftLocked ? 'Pedido abierto' : 'Agregar'}
+                          </button>
+                        )}
                       </div>
                     </article>
                   );
@@ -414,12 +447,16 @@ export default function TableMenuPage() {
         </section>
       )}
 
-      {orderConfirmed && (
-        <div className="toast-success">
-          <CheckCircle size={22} color="white" />
-          ¡Pedido enviado a cocina!
-        </div>
-      )}
+      <OrderConfirmedModal isOpen={orderConfirmed} onClose={clearOrderConfirmed} />
+
+      <FloatingOrderDock
+        tableId={tableId}
+        activeOrder={activeOrder}
+        activeOrderItemsCount={activeOrderItemsCount}
+        cart={cart}
+        cartItemsCount={cart.reduce((sum, item) => sum + item.quantity, 0)}
+        cartTotal={cart.reduce((sum, item) => sum + (item.price * item.quantity), 0)}
+      />
     </div>
   );
 }

@@ -1,6 +1,17 @@
 const ACTIVE_REQUEST_STATUSES = ['pending'];
 const VALID_REQUEST_STATUSES = new Set([...ACTIVE_REQUEST_STATUSES, 'resolved']);
 const VALID_REQUEST_TYPES = new Set(['call_waiter', 'request_bill']);
+const TABLE_REQUEST_SELECT_FIELDS = `
+  tr.id,
+  tr.table_id,
+  tr.type,
+  tr.status,
+  tr.created_at,
+  tr.resolved_at,
+  o.bill_attended_at,
+  o.bill_payment_method_preference,
+  o.bill_collection_status
+`;
 
 function createTableRequestError(code, message, status = 400) {
   const error = new Error(message);
@@ -41,16 +52,33 @@ function mapTableRequest(row) {
     status: row.status,
     created_at: row.created_at,
     resolved_at: row.resolved_at || null,
+    bill_attended_at: row.bill_attended_at || null,
+    bill_payment_method_preference: row.bill_payment_method_preference || null,
+    bill_collection_status: row.bill_collection_status || null,
   };
+}
+
+function buildTableRequestOrderJoin() {
+  return `
+    LEFT JOIN orders o ON o.id = (
+      SELECT o2.id
+      FROM orders o2
+      WHERE o2.table_id = tr.table_id
+        AND o2.closed_at IS NULL
+      ORDER BY o2.created_at DESC, o2.id DESC
+      LIMIT 1
+    )
+  `;
 }
 
 async function getTableRequestById(database, requestId) {
   const normalizedRequestId = ensurePositiveInteger(requestId, 'request_id');
   const row = await database.get(
     `
-      SELECT id, table_id, type, status, created_at, resolved_at
-      FROM table_requests
-      WHERE id = ?
+      SELECT ${TABLE_REQUEST_SELECT_FIELDS}
+      FROM table_requests tr
+      ${buildTableRequestOrderJoin()}
+      WHERE tr.id = ?
     `,
     [normalizedRequestId]
   );
@@ -61,12 +89,13 @@ async function getTableRequestById(database, requestId) {
 async function listTableRequests(database) {
   const rows = await database.all(
     `
-      SELECT id, table_id, type, status, created_at, resolved_at
-      FROM table_requests
+      SELECT ${TABLE_REQUEST_SELECT_FIELDS}
+      FROM table_requests tr
+      ${buildTableRequestOrderJoin()}
       ORDER BY
-        CASE status WHEN 'pending' THEN 0 ELSE 1 END,
-        created_at DESC,
-        id DESC
+        CASE tr.status WHEN 'pending' THEN 0 ELSE 1 END,
+        tr.created_at DESC,
+        tr.id DESC
     `
   );
 
@@ -77,11 +106,12 @@ async function listActiveTableRequestsForTable(database, tableId) {
   const normalizedTableId = ensurePositiveInteger(tableId, 'table_id');
   const rows = await database.all(
     `
-      SELECT id, table_id, type, status, created_at, resolved_at
-      FROM table_requests
-      WHERE table_id = ?
-        AND status IN (${ACTIVE_REQUEST_STATUSES.map(() => '?').join(', ')})
-      ORDER BY created_at DESC, id DESC
+      SELECT ${TABLE_REQUEST_SELECT_FIELDS}
+      FROM table_requests tr
+      ${buildTableRequestOrderJoin()}
+      WHERE tr.table_id = ?
+        AND tr.status IN (${ACTIVE_REQUEST_STATUSES.map(() => '?').join(', ')})
+      ORDER BY tr.created_at DESC, tr.id DESC
     `,
     [normalizedTableId, ...ACTIVE_REQUEST_STATUSES]
   );
@@ -108,7 +138,7 @@ async function createTableRequest(database, payload) {
 
   if (existingRequest) {
     return {
-      ...mapTableRequest(existingRequest),
+      ...(await getTableRequestById(database, existingRequest.id)),
       already_pending: true,
     };
   }
@@ -221,6 +251,39 @@ async function resolvePendingTableRequestsForTable(database, tableId) {
   return resolvedRequests;
 }
 
+async function resolvePendingTableRequestsForTableByType(database, tableId, type) {
+  const normalizedTableId = ensurePositiveInteger(tableId, 'table_id');
+  const normalizedType = normalizeRequestType(type);
+  const pendingRows = await database.all(
+    `
+      SELECT id
+      FROM table_requests
+      WHERE table_id = ?
+        AND type = ?
+        AND status = 'pending'
+      ORDER BY created_at DESC, id DESC
+    `,
+    [normalizedTableId, normalizedType]
+  );
+
+  const resolvedRequests = [];
+
+  for (const row of pendingRows) {
+    await database.run(
+      `
+        UPDATE table_requests
+        SET status = 'resolved',
+            resolved_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `,
+      [row.id]
+    );
+    resolvedRequests.push(await getTableRequestById(database, row.id));
+  }
+
+  return resolvedRequests;
+}
+
 module.exports = {
   ACTIVE_REQUEST_STATUSES,
   VALID_REQUEST_TYPES,
@@ -231,5 +294,6 @@ module.exports = {
   listTableRequests,
   cancelTableRequestForTable,
   resolvePendingTableRequestsForTable,
+  resolvePendingTableRequestsForTableByType,
   resolveTableRequest,
 };

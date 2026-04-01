@@ -1,30 +1,55 @@
 # Mozzo
 
-Mozzo es una base para pedidos de restaurante con dos superficies:
+Mozzo es una app de restaurante orientada a salón con dos superficies principales:
 
-- frontend React/Vite para cliente por mesa y panel admin
-- backend Node/Express + Socket.IO + SQLite
+- cliente por mesa, accesible por URL/QR
+- panel admin para operación del local
 
-El flujo core cubierto hoy es:
+La base actual cubre:
 
-1. publicar un menú versionado sin borrar historial
-2. tomar pedidos por mesa
-3. ver y actualizar pedidos desde admin
-4. mantener histórico renderizable desde snapshots en `order_items`
+- menú versionado
+- importación de menú por foto, IA externa y constructor manual
+- disponibilidad por producto
+- un pedido abierto por mesa
+- lifecycle operativo del pedido
+- solicitud y entrega de cuenta
+- múltiples pagos por pedido
+- split payment por monto
+- caja / arqueo simple
+- cierre explícito de mesa
+- historial operativo de pedidos cerrados
+- configuración básica del local
 
-OCR de menú existe como feature opcional, pero no forma parte del core testable ni de la CI.
+No cubre todavía:
 
-## Requisitos
+- pasarela de pago real
+- reversos o refunds
+- split bill por comensal o por item
+- multi-sucursal
+- roles finos de staff
+- arqueo avanzado o caja ciega
 
-- Node `22.x`
-- npm `10+`
-- Python `3.x` solo si vas a usar importación de menú por foto
+## Documentación
 
-La versión de runtime soportada en el repo está fijada en `.nvmrc`.
+Punto de entrada recomendado:
 
-## Setup Rápido
+- [SYSTEM_OVERVIEW.md](/Users/nicoavayu/Downloads/Mozzo/SYSTEM_OVERVIEW.md)
 
-Primer arranque recomendado desde un clone limpio:
+Detalle por tema:
+
+- [docs/current-state.md](/Users/nicoavayu/Downloads/Mozzo/docs/current-state.md)
+- [docs/architecture.md](/Users/nicoavayu/Downloads/Mozzo/docs/architecture.md)
+- [docs/backend-api.md](/Users/nicoavayu/Downloads/Mozzo/docs/backend-api.md)
+- [docs/payments-and-closing.md](/Users/nicoavayu/Downloads/Mozzo/docs/payments-and-closing.md)
+- [docs/cash-register.md](/Users/nicoavayu/Downloads/Mozzo/docs/cash-register.md)
+- [docs/admin-flows.md](/Users/nicoavayu/Downloads/Mozzo/docs/admin-flows.md)
+
+## Stack
+
+- frontend: React + Vite + Socket.IO
+- backend: Node + Express + Socket.IO + SQLite
+
+## Setup rápido
 
 ```bash
 nvm use
@@ -36,190 +61,81 @@ npm run db:seed
 npm run dev
 ```
 
-Notas:
+Abrir:
 
-- `npm run db:migrate` crea una base vacía con schema actualizado.
-- `npm run db:seed` agrega un menú de ejemplo para probar rápido. No crea pedidos.
-- Si querés una base vacía sin menú de ejemplo, corré solo `npm run db:migrate`.
+- cliente: `http://localhost:5173/:tableId`
+- admin: `http://localhost:5173/admin`
+- backend: `http://localhost:3000`
 
-## Scripts
-
-En la raíz:
-
-```bash
-npm run setup        # instala frontend + backend con npm ci
-npm run dev          # levanta backend y frontend en paralelo
-npm run dev:backend
-npm run dev:frontend
-npm run db:migrate
-npm run db:seed
-npm run build        # build del frontend
-npm run check        # check backend + lint/build frontend
-npm run smoke        # smoke core end-to-end sin OCR
-```
-
-## Variables de Entorno
+## Variables de entorno relevantes
 
 ### Backend
 
-Definidas en `backend/.env.example`.
+Definidas en [backend/.env.example](/Users/nicoavayu/Downloads/Mozzo/backend/.env.example).
 
-Obligatorias en uso real:
+Obligatorias para admin:
 
-- `ADMIN_PASSWORD`: password del panel admin
-- `ADMIN_TOKEN_SECRET`: secreto para firmar tokens admin
+- `ADMIN_PASSWORD`
+- `ADMIN_TOKEN_SECRET`
 
-Opcionales con default local:
+Opcionales:
 
-- `PORT`: default `3000`
-- `DATABASE_PATH`: default `./database.sqlite`
-- `UPLOAD_DIR`: default `./uploads`
-- `FRONTEND_URL`: default `http://localhost:5173`
-- `PYTHON_BIN`: default `./venv/bin/python3`
-- `PROCESS_MENU_SCRIPT`: default `./process_menu.py`
+- `PORT`
+- `DB_PATH` o `DATABASE_PATH`
+- `UPLOAD_DIR`
+- `FRONTEND_URL`
+- `PYTHON_BIN`
+- `PROCESS_MENU_SCRIPT`
+- `GUEST_FEEDBACK_URL`
+- `GUEST_REVIEW_URL`
 
 Notas:
 
-- El backend carga `backend/.env` automáticamente.
-- Si faltan `ADMIN_PASSWORD` o `ADMIN_TOKEN_SECRET`, el login admin no funciona.
-- `DATABASE_PATH`, `UPLOAD_DIR`, `PYTHON_BIN` y `PROCESS_MENU_SCRIPT` se resuelven desde el directorio `backend`.
+- si no definís `DB_PATH` ni `DATABASE_PATH`, el backend usa `~/.mozzo/data/database.sqlite`
+- el backend ya no depende de un `database.sqlite` mutable dentro del repo como path principal
 
 ### Frontend
 
 Definidas en `frontend/.env.example`.
 
-Opcionales con default local:
+- `VITE_API_URL` opcional, con default local
 
-- `VITE_API_URL`: default `http://localhost:3000`
+## Scripts principales
 
-Vite carga `frontend/.env` automáticamente.
-
-## Migraciones y Seed
-
-Las migraciones viven en `backend/migrations`.
-
-Comandos:
+En la raíz:
 
 ```bash
+npm run setup
+npm run dev
+npm run dev:backend
+npm run dev:frontend
 npm run db:migrate
 npm run db:seed
-```
-
-Qué hacen:
-
-- `db:migrate`: aplica schema base, migraciones legacy y extensiones de snapshots
-- `db:seed`: publica un menú de ejemplo solo si la tabla `menus` está vacía
-
-## Smoke Core
-
-El smoke vive en `backend/scripts/smoke.js` y cubre:
-
-- boot del backend
-- `GET /api/health`
-- login admin
-- protección de rutas admin
-- publicación de menú
-- creación de pedido con contrato actual
-- realtime mesa/admin
-- cambio de estado
-- persistencia de snapshots
-- recuperación de pedido activo por mesa
-
-No cubre OCR ni depende de archivos persistidos en el repo.
-
-Ejecución:
-
-```bash
-npm run smoke
-```
-
-## Flujo de Desarrollo Local
-
-1. levantar dependencias con `npm run setup`
-2. copiar `.env.example` a `.env` en `backend` y `frontend`
-3. correr `npm run db:migrate`
-4. opcionalmente correr `npm run db:seed`
-5. levantar `npm run dev`
-6. abrir:
-   - cliente: `http://localhost:5173/:tableId`
-   - admin: `http://localhost:5173/admin`
-   - backend: `http://localhost:3000`
-
-Comandos útiles:
-
-```bash
+npm run build
 npm run check
 npm run smoke
 ```
 
-## Backup y Restore de SQLite
-
-Script incluido:
-
-- `backend/scripts/backup-sqlite.sh`
-
-Uso:
+Backend:
 
 ```bash
-sh backend/scripts/backup-sqlite.sh
-sh backend/scripts/backup-sqlite.sh /ruta/origen.sqlite /ruta/destino.sqlite
+npm --prefix backend run smoke
+npm --prefix backend run test:sprint5
+npm --prefix backend run test:sprint6
+npm --prefix backend run test:sprint7
+npm --prefix backend run test:hardening
 ```
 
-Comportamiento:
-
-- si existe `backend/.env`, toma `DATABASE_PATH` desde ahí
-- si no, usa `backend/database.sqlite`
-- crea una copia consistente usando la API de backup de SQLite, sin depender del binario `sqlite3`
-
-Restore manual básico:
-
-1. detener el backend
-2. copiar el backup sobre la base activa
-3. volver a arrancar el backend
-4. si el código avanzó desde ese backup, correr `npm run db:migrate`
-
-Ejemplo:
+Frontend:
 
 ```bash
-cp backend/backups/mozzo-YYYYMMDD-HHMMSS.sqlite backend/database.sqlite
-npm run db:migrate
-npm run dev:backend
+npm --prefix frontend run check
+npm --prefix frontend run test:sprint7
 ```
 
-Si querés preservar uploads históricos, respaldá `UPLOAD_DIR` por separado. El script incluido solo cubre SQLite.
+## Regla operativa clave de la versión actual
 
-## Perfil de Deploy Soportado
-
-Perfil soportado hoy:
-
-- una sola instancia de backend
-- disco persistente para `DATABASE_PATH` y `UPLOAD_DIR`
-- frontend estático servido por cualquier hosting estático
-
-No es un perfil multi-instancia todavía:
-
-- SQLite es la base principal
-- Socket.IO usa rooms en memoria del proceso
-
-Configuración de deploy mínima:
-
-- backend con `ADMIN_PASSWORD`, `ADMIN_TOKEN_SECRET`, `FRONTEND_URL`
-- volumen persistente montado para DB y uploads
-- frontend buildado con `VITE_API_URL` apuntando al backend público
-
-## CI
-
-La workflow mínima vive en `.github/workflows/ci.yml` y corre:
-
-1. instalación con `npm ci`
-2. build del frontend
-3. `check` del backend
-4. smoke core sin OCR
-
-## Estado del Repo
-
-El repo ya no depende de un `database.sqlite` versionado ni de assets/template de Vite no usados. El estado reproducible esperado sale de:
-
-- `npm run setup`
-- `npm run db:migrate`
-- `npm run db:seed` opcional
+- registrar pago **no** cierra la mesa
+- la mesa se cierra en una acción aparte
+- solo se puede cerrar si el pedido quedó totalmente saldado
+- `closed_at` sigue siendo la fuente de verdad del cierre y del historial

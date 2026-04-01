@@ -1,12 +1,28 @@
-import { ArrowLeft, CheckCircle, ShoppingBag, Sparkles } from 'lucide-react';
+import { CheckCircle2, ShoppingBag, Sparkles, Wallet } from 'lucide-react';
 import { Link, useOutletContext } from 'react-router-dom';
-import { ACTIVE_ORDER_STATUS_LABELS, formatMoney } from '../../hooks/useTableSession';
+import { formatMoney } from '../../hooks/useTableSession';
+import { formatBillCollectionStatusLabel, formatBillPaymentMethodLabel } from '../../lib/billFlow';
+import { getSuborderLabel, getSuborderStatusDescriptor, sortSuborders } from '../../lib/suborders';
+import OrderConfirmedModal from './OrderConfirmedModal';
 
 export default function TableOrderPage() {
   const {
     tableId,
     activeOrder,
+    activeOrderSubordersCount,
     activeOrderTotal,
+    activeOrderAmountPaid,
+    activeOrderAmountDue,
+    activeOrderPaymentStatus,
+    activeOrderCustomerStatus,
+    billPaymentMethodPreference,
+    billCollectionStatus,
+    canPayWithMercadoPago,
+    startingMercadoPagoCheckout,
+    startMercadoPagoCheckout,
+    mercadoPagoActionError,
+    mercadoPagoFeedback,
+    orderStatusFeedback,
     activeOrderStatus,
     activeOrderError,
     menuAvailabilityFeedback,
@@ -16,36 +32,26 @@ export default function TableOrderPage() {
     placingOrder,
     orderError,
     orderConfirmed,
+    clearOrderConfirmed,
     isDraftLocked,
     draftLockedReason,
     updateQuantity,
     updateComment,
     placeOrder,
     reloadSession,
+    clearOrderStatusFeedback,
   } = useOutletContext();
 
   const hasDraft = cartItemsCount > 0 && !isDraftLocked;
   const hasActiveOrder = Boolean(activeOrder);
+  const sortedSuborders = sortSuborders(activeOrder?.suborders || []);
 
   if (activeOrderStatus === 'loading' && !hasActiveOrder && !hasDraft) {
     return <div className="loader"></div>;
   }
 
   return (
-    <>
-      <section className="table-page-head glass-panel">
-        <Link className="btn" to={`/${tableId}`}>
-          <ArrowLeft size={16} /> Inicio
-        </Link>
-        <div className="table-page-head-copy">
-          <strong>Mi pedido</strong>
-          <span>Seguimiento y borrador</span>
-        </div>
-        <Link className="btn" to={`/${tableId}/menu`}>
-          Ver menú
-        </Link>
-      </section>
-
+    <div className="table-order-page">
       {activeOrderStatus === 'error' && (
         <div className="glass-panel status-card status-card-error">
           <div>
@@ -82,46 +88,107 @@ export default function TableOrderPage() {
 
       {hasActiveOrder && (
         <section className="glass-panel table-order-section is-live">
-          <div className="table-section-head">
+          <div className="table-section-head table-section-head-order">
             <div>
-              <span className="client-section-label">Pedido enviado</span>
-              <h2>Pedido #{activeOrder.id}</h2>
+              <h2>Mi pedido</h2>
+              <span className="table-order-section-copy">
+                Seguimiento de tus envíos y de la cuenta abierta de la mesa.
+              </span>
             </div>
             <div className="table-request-card-meta-row">
               <span className="table-badge">
-                {ACTIVE_ORDER_STATUS_LABELS[activeOrder.status] || activeOrder.status}
+                {activeOrderCustomerStatus?.badge || activeOrder.status}
               </span>
               {activeOrder.bill_requested_at && (
-                <span className="table-badge">Cuenta pedida</span>
+                <span className="table-badge">Pedida</span>
               )}
               {activeOrder.bill_attended_at && (
-                <span className="table-badge">Cuenta entregada</span>
+                <span className="table-badge">Entregada</span>
+              )}
+              {activeOrderPaymentStatus === 'partial' && (
+                <span className="table-badge">Pago parcial</span>
+              )}
+              {activeOrderPaymentStatus === 'paid' && (
+                <span className="table-badge">Pago completo</span>
               )}
             </div>
           </div>
 
-          <div className="cart-items-list">
-            {(activeOrder.items || []).map((item) => (
-              <div className="cart-item-row" key={`${activeOrder.id}-${item.item_id}-${item.comments || ''}`}>
-                <div className="cart-item-details">
-                  <div className="cart-item-name">{item.quantity}x {item.name}</div>
-                  <div className="cart-item-price">{formatMoney(item.price * item.quantity)}</div>
-                  {item.comments && <div className="item-comment">"{item.comments}"</div>}
+          <div className="table-suborders-stack">
+            {sortedSuborders.map((suborder) => {
+              const suborderStatus = getSuborderStatusDescriptor(suborder);
+
+              return (
+                <div className="table-suborder-card" key={`suborder-${suborder.id}`}>
+                  <div className="table-suborder-card-head">
+                    <div>
+                      <strong>{getSuborderLabel(suborder.sequence_number)}</strong>
+                      <span>{suborder.created_at ? new Date(suborder.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}</span>
+                    </div>
+                    <span className="table-badge">
+                      {suborderStatus?.badge || suborder.status}
+                    </span>
+                  </div>
+                  <div className="cart-items-list">
+                    {(suborder.items || []).map((item) => (
+                      <div className="cart-item-row" key={`${suborder.id}-${item.item_id}-${item.comments || ''}`}>
+                        <div className="cart-item-details">
+                          <div className="cart-item-name">{item.quantity}x {item.name}</div>
+                          <div className="cart-item-price">{formatMoney(item.price * item.quantity)}</div>
+                          {item.comments && <div className="item-comment">"{item.comments}"</div>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
 
-          <div className="cart-footer">
-            <div className="grand-total">Total enviado: {formatMoney(activeOrderTotal)}</div>
+          <div className="table-order-summary-strip">
+            <div className="table-order-summary-primary">
+              Cuenta abierta: {activeOrderSubordersCount || 1} {activeOrderSubordersCount === 1 ? 'envío' : 'envíos'} · {formatMoney(activeOrderTotal)}
+            </div>
+            {(activeOrderAmountPaid > 0 || activeOrderPaymentStatus === 'paid') && (
+              <div className="table-order-summary-secondary">
+                Pagado: {formatMoney(activeOrderAmountPaid)} · Saldo: {formatMoney(activeOrderAmountDue)}
+              </div>
+            )}
+            {activeOrder.bill_requested_at && billPaymentMethodPreference && activeOrderAmountDue > 0 && (
+              <div className="table-order-summary-secondary">
+                Método elegido: {formatBillPaymentMethodLabel(billPaymentMethodPreference)} · {formatBillCollectionStatusLabel(billCollectionStatus)}
+              </div>
+            )}
           </div>
+          {canPayWithMercadoPago && (
+            <div className="order-payment-cta">
+              <div>
+                <strong>Pagar desde Mozzo</strong>
+                <span>Podés saldar la mesa online con Mercado Pago por {formatMoney(activeOrderAmountDue)}.</span>
+              </div>
+              <button
+                className="btn btn-primary"
+                type="button"
+                onClick={startMercadoPagoCheckout}
+                disabled={startingMercadoPagoCheckout}
+              >
+                <Wallet size={18} />
+                {startingMercadoPagoCheckout ? 'Abriendo Mercado Pago...' : 'Pagar con Mercado Pago'}
+              </button>
+            </div>
+          )}
+          {(mercadoPagoActionError || mercadoPagoFeedback) && (
+            <div className={`order-inline-error ${mercadoPagoFeedback?.type === 'success' ? 'is-success' : ''}`}>
+              {mercadoPagoActionError || mercadoPagoFeedback?.message}
+            </div>
+          )}
         </section>
       )}
 
-      {hasActiveOrder && (
+      {hasActiveOrder && isDraftLocked && (
         <div className="glass-panel status-card">
           <div>
-            <strong>No podés empezar otro pedido todavía.</strong>
+            <strong>No se pueden agregar más pedidos.</strong>
             <span>{draftLockedReason}</span>
           </div>
           <Link className="btn" to={`/${tableId}/menu`}>
@@ -171,18 +238,26 @@ export default function TableOrderPage() {
           <div className="cart-footer">
             <div className="grand-total">Total: {formatMoney(cartTotal)}</div>
             <button className="btn btn-primary" type="button" onClick={placeOrder} disabled={placingOrder}>
-              {placingOrder ? 'Confirmando...' : <><Sparkles size={18} /> Confirmar pedido</>}
+              {placingOrder ? 'Confirmando...' : <><Sparkles size={18} /> {hasActiveOrder ? 'Enviar adicional' : 'Confirmar pedido'}</>}
             </button>
           </div>
         </section>
       )}
 
-      {orderConfirmed && (
+      <OrderConfirmedModal isOpen={orderConfirmed} onClose={clearOrderConfirmed} />
+
+      {orderStatusFeedback && (
         <div className="toast-success">
-          <CheckCircle size={22} color="white" />
-          ¡Pedido enviado a cocina!
+          <CheckCircle2 size={22} color="white" />
+          <div className="toast-success-copy">
+            <strong>{orderStatusFeedback.title}</strong>
+            <span>{orderStatusFeedback.message}</span>
+          </div>
+          <button className="btn" type="button" onClick={clearOrderStatusFeedback} aria-label="Cerrar actualización del pedido">
+            Cerrar
+          </button>
         </div>
       )}
-    </>
+    </div>
   );
 }

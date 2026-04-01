@@ -92,7 +92,7 @@ export function shouldDiscardPersistedDraft({ persistedDraft, activeOrder, lates
     return false;
   }
 
-  if (activeOrder) {
+  if (activeOrder?.bill_requested_at) {
     return true;
   }
 
@@ -111,5 +111,5 @@ export function shouldDiscardPersistedDraft({ persistedDraft, activeOrder, lates
 }
 
 export function isDraftLockedByActiveOrder(activeOrder) {
-  return Boolean(activeOrder);
+  return Boolean(activeOrder?.bill_requested_at || activeOrder?.closed_at);
 }

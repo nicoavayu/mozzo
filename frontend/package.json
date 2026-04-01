@@ -16,6 +16,13 @@
     "test:sprint3": "node scripts/test-sprint3.js",
     "test:sprint4": "node scripts/test-sprint4.js",
     "test:sprint6": "node scripts/test-sprint6.js",
+    "test:sprint7": "node scripts/test-sprint7.js",
+    "test:sprint8": "node scripts/test-sprint8.js",
+    "test:sprint9": "node scripts/test-sprint9.js",
+    "test:sprint11": "node scripts/test-sprint11.js",
+    "test:sprint12": "node scripts/test-sprint12.js",
+    "test:order-status": "node scripts/test-order-status.js",
+    "test:admin-sounds": "node scripts/test-admin-sounds.js",
     "test:hardening": "node scripts/test-hardening.js",
     "preview": "vite preview"
   },

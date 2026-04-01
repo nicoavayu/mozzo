@@ -347,14 +347,6 @@ async function testPaymentLifecycle() {
       await updateOrderStatus(adminSocket, adminToken, orderId, 'ready');
       await updateOrderStatus(adminSocket, adminToken, orderId, 'delivered');
 
-      const invalidPaymentMethod = await requestJson(`${baseUrl}/api/tables/5/payment`, {
-        method: 'POST',
-        headers: authHeaders(adminToken, true),
-        body: JSON.stringify({ payment_method: 'bitcoin' }),
-      });
-      assert.equal(invalidPaymentMethod.response.status, 400);
-      assert.equal(invalidPaymentMethod.body.code, 'INVALID_PAYMENT_METHOD');
-
       const paymentBeforeBillDelivered = await requestJson(`${baseUrl}/api/tables/5/payment`, {
         method: 'POST',
         headers: authHeaders(adminToken, true),
@@ -375,6 +367,14 @@ async function testPaymentLifecycle() {
       assert.equal(resolveDeliveredBill.response.status, 200);
       await deliveredBillOrder;
 
+      const invalidPaymentMethod = await requestJson(`${baseUrl}/api/tables/5/payment`, {
+        method: 'POST',
+        headers: authHeaders(adminToken, true),
+        body: JSON.stringify({ payment_method: 'bitcoin' }),
+      });
+      assert.equal(invalidPaymentMethod.response.status, 400);
+      assert.equal(invalidPaymentMethod.body.code, 'INVALID_PAYMENT_METHOD');
+
       const paidOrder = waitForSocketEvent(
         adminSocket,
         'order_updated',
@@ -388,8 +388,21 @@ async function testPaymentLifecycle() {
       assert.equal(payment.response.status, 200);
       assert.equal(payment.body.payment_method, 'transfer');
       assert.ok(payment.body.payment_received_at);
-      assert.ok(payment.body.closed_at);
+      assert.equal(payment.body.closed_at, null);
       await paidOrder;
+
+      const closedOrder = waitForSocketEvent(
+        adminSocket,
+        'order_updated',
+        (order) => order?.id === orderId && Boolean(order?.closed_at)
+      );
+      const closeResponse = await requestJson(`${baseUrl}/api/tables/5/close`, {
+        method: 'POST',
+        headers: authHeaders(adminToken),
+      });
+      assert.equal(closeResponse.response.status, 200);
+      assert.ok(closeResponse.body.closed_at);
+      await closedOrder;
 
       const duplicatePayment = await requestJson(`${baseUrl}/api/tables/5/payment`, {
         method: 'POST',

@@ -1,9 +1,31 @@
-import { Bell, ClipboardList, MessageSquareText, Receipt, Sparkles, Star, X } from 'lucide-react';
+import { Banknote, Bell, Check, ClipboardList, CreditCard, MessageSquareText, Receipt, Sparkles, Star, Wallet, X } from 'lucide-react';
 import { useState } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import { formatMoney } from '../../hooks/useTableSession';
+import {
+  BILL_PAYMENT_METHOD_OPTIONS,
+  formatBillPaymentMethodLabel,
+} from '../../lib/billFlow';
 import { getVisibleVenueLinks } from '../../lib/venueSettings';
 import DashboardActionCard from './DashboardActionCard';
+
+const BILL_METHOD_ICON_MAP = {
+  cash: Banknote,
+  card: CreditCard,
+  mercado_pago: Wallet,
+};
+
+const BILL_METHOD_META_COPY = {
+  cash: 'Cobro en mesa',
+  card: 'Terminal en mesa',
+  mercado_pago: 'Pago online',
+};
+
+const BILL_METHOD_THEME_CLASS = {
+  cash: 'is-cash',
+  card: 'is-card',
+  mercado_pago: 'is-mercado-pago',
+};
 
 export default function TableDashboardPage() {
   const {
@@ -12,32 +34,44 @@ export default function TableDashboardPage() {
     activeOrderStatus,
     activeOrderError,
     activeOrderItemsCount,
+    activeOrderSubordersCount,
     activeOrderTotal,
+    activeOrderAmountDue,
+    activeOrderPaymentStatus,
+    activeOrderCustomerStatus,
+    billPaymentMethodPreference,
     cartItemsCount,
-    canRequestBill,
+    canManageBillFlow,
     isWaiterRequested,
     isBillRequested,
     isBillAttended,
     submittingRequestType,
+    canPayWithMercadoPago,
+    startingMercadoPagoCheckout,
+    startMercadoPagoCheckout,
+    mercadoPagoActionError,
+    mercadoPagoFeedback,
     submitTableRequest,
     cancelTableRequest,
     tableRequestFeedback,
     tableRequestActionError,
+    orderStatusFeedback,
     venueSettings,
     clearTableRequestMessages,
+    clearMercadoPagoMessages,
+    clearOrderStatusFeedback,
     reloadSession,
   } = useOutletContext();
   const [isBillConfirmOpen, setIsBillConfirmOpen] = useState(false);
+  const [selectedBillMethod, setSelectedBillMethod] = useState(billPaymentMethodPreference || 'cash');
 
-  const myOrderBadge = activeOrder ? 'En curso' : cartItemsCount > 0 ? 'Pendiente' : '';
+  const myOrderBadge = activeOrder ? activeOrderCustomerStatus?.badge || 'En curso' : cartItemsCount > 0 ? 'Pendiente' : '';
   const myOrderSubtitle = activeOrder
-    ? `${activeOrderItemsCount} ${activeOrderItemsCount === 1 ? 'ítem' : 'ítems'} · ${formatMoney(activeOrderTotal)}`
+    ? `${activeOrderSubordersCount || 1} ${activeOrderSubordersCount === 1 ? 'envío' : 'envíos'} · ${activeOrderItemsCount} ${activeOrderItemsCount === 1 ? 'ítem' : 'ítems'} · ${formatMoney(activeOrderTotal)}`
     : cartItemsCount > 0
       ? `${cartItemsCount} ${cartItemsCount === 1 ? 'ítem pendiente' : 'ítems pendientes'}`
       : 'Todavía vacío';
-  const myOrderHint = activeOrder && cartItemsCount > 0
-    ? `${cartItemsCount} ${cartItemsCount === 1 ? 'ítem' : 'ítems'} en borrador`
-    : '';
+  const myOrderHint = '';
 
   const shouldShowTableRequestToast = Boolean(tableRequestFeedback) || Boolean(tableRequestActionError);
   const hasTableRequestError = Boolean(tableRequestActionError);
@@ -60,6 +94,8 @@ export default function TableDashboardPage() {
   const canCancelBillRequest = isBillRequested && !isBillAttended;
   const showGuestFeedbackActions = isBillRequested;
   const hasGuestFeedbackLinks = Boolean(guestFeedbackLinks.feedbackUrl || guestFeedbackLinks.reviewUrl);
+  const shouldShowMercadoPagoToast = Boolean(mercadoPagoFeedback) || Boolean(mercadoPagoActionError);
+  const mercadoPagoIsError = Boolean(mercadoPagoActionError) || mercadoPagoFeedback?.type === 'error';
 
   const handleWaiterAction = () => {
     if (isWaiterRequested) {
@@ -71,22 +107,44 @@ export default function TableDashboardPage() {
   };
 
   const handleBillAction = () => {
-    if (canCancelBillRequest) {
-      cancelTableRequest('request_bill');
+    if (!canManageBillFlow) {
       return;
     }
 
-    if (!canRequestBill) {
-      return;
-    }
-
+    setSelectedBillMethod(billPaymentMethodPreference || 'cash');
     setIsBillConfirmOpen(true);
   };
 
-  const confirmBillRequest = () => {
+  const confirmBillRequest = async () => {
+    const response = await submitTableRequest('request_bill', {
+      preferred_payment_method: selectedBillMethod,
+    });
+
+    if (!response) {
+      return;
+    }
+
     setIsBillConfirmOpen(false);
-    submitTableRequest('request_bill');
+
+    if (selectedBillMethod === 'mercado_pago' && response.should_start_online_checkout) {
+      startMercadoPagoCheckout({ order: response.order });
+    }
   };
+
+  const billCardSubtitle = activeOrderPaymentStatus === 'paid'
+    ? 'Pago registrado'
+    : billPaymentMethodPreference
+      ? isBillRequested
+        ? `${formatBillPaymentMethodLabel(billPaymentMethodPreference)} · podés cambiarlo o cancelarlo`
+        : formatBillPaymentMethodLabel(billPaymentMethodPreference)
+      : '';
+  const billCardBadge = activeOrderPaymentStatus === 'paid'
+    ? 'Pagado'
+    : isBillAttended
+      ? 'Cuenta entregada'
+      : isBillRequested
+        ? 'Cuenta pedida'
+        : '';
 
   return (
     <main className="table-dashboard-page">
@@ -137,18 +195,26 @@ export default function TableDashboardPage() {
         <DashboardActionCard
           icon={Receipt}
           title="Pedir la cuenta"
-          subtitle={isBillAttended ? 'Cuenta entregada' : canCancelBillRequest ? 'Tocá para cancelar el pedido' : isBillRequested ? 'Cuenta pedida' : ''}
+          subtitle={billCardSubtitle}
+          badge={billCardBadge}
           hint={
-            !canRequestBill && !canCancelBillRequest
-              ? 'Necesitás un pedido enviado'
-              : canCancelBillRequest
-                ? 'Podés cancelarlo si fue un error y todavía no lo atendieron.'
+            canCancelBillRequest
+              ? 'Podés cambiar cómo querés pagar o cancelar el pedido de cuenta.'
               : ''
           }
-          badge={isBillAttended ? 'Entregada' : isBillRequested ? 'Solicitada' : ''}
-          disabled={Boolean(submittingRequestType) || isBillAttended || (!canRequestBill && !canCancelBillRequest)}
+          disabled={Boolean(submittingRequestType) || !canManageBillFlow}
           onClick={handleBillAction}
         />
+        {(canPayWithMercadoPago || startingMercadoPagoCheckout) && (
+          <DashboardActionCard
+            icon={Wallet}
+            title="Pagar online"
+            subtitle={startingMercadoPagoCheckout ? 'Abriendo Mercado Pago...' : 'Mercado Pago'}
+            hint={activeOrderAmountDue > 0 ? `Saldo actual ${formatMoney(activeOrderAmountDue)}` : ''}
+            disabled={Boolean(submittingRequestType) || startingMercadoPagoCheckout}
+            onClick={startMercadoPagoCheckout}
+          />
+        )}
       </section>
 
       {shouldShowTableRequestToast && (
@@ -162,6 +228,35 @@ export default function TableDashboardPage() {
             <span>{tableRequestActionError || tableRequestFeedback}</span>
           </div>
           <button className="btn" type="button" onClick={clearTableRequestMessages} aria-label="Cerrar notificación">
+            <X size={16} />
+          </button>
+        </div>
+      )}
+
+      {shouldShowMercadoPagoToast && (
+        <div
+          className={`dashboard-toast glass-panel ${mercadoPagoIsError ? 'is-error' : mercadoPagoFeedback?.type === 'success' ? 'is-success' : ''}`}
+          role="status"
+          aria-live="polite"
+        >
+          <div className="dashboard-toast-copy">
+            <strong>{mercadoPagoActionError ? 'No pudimos abrir Mercado Pago.' : mercadoPagoFeedback?.title || 'Mercado Pago'}</strong>
+            <span>{mercadoPagoActionError || mercadoPagoFeedback?.message}</span>
+          </div>
+          <button className="btn" type="button" onClick={clearMercadoPagoMessages} aria-label="Cerrar notificación">
+            <X size={16} />
+          </button>
+        </div>
+      )}
+
+      {orderStatusFeedback && (
+        <div className="toast-success">
+          <Check size={22} color="white" />
+          <div className="toast-success-copy">
+            <strong>{orderStatusFeedback.title}</strong>
+            <span>{orderStatusFeedback.message}</span>
+          </div>
+          <button className="btn" type="button" onClick={clearOrderStatusFeedback} aria-label="Cerrar actualización del pedido">
             <X size={16} />
           </button>
         </div>
@@ -238,18 +333,74 @@ export default function TableDashboardPage() {
           >
             <div className="modal-header">
               <div>
+                <span className="table-confirm-modal-kicker">Cobro de la mesa</span>
                 <h2 id="bill-confirm-title">¿Pedir la cuenta?</h2>
-                <p className="table-confirm-modal-copy">
-                  Le vamos a avisar al salón que querés cerrar la mesa.
-                </p>
               </div>
             </div>
+            <div className="bill-method-choice-grid">
+              {BILL_PAYMENT_METHOD_OPTIONS.map((option) => (
+                (() => {
+                  const OptionIcon = BILL_METHOD_ICON_MAP[option.value] || Wallet;
+
+                  return (
+                    <button
+                      key={option.value}
+                      className={`bill-method-choice ${BILL_METHOD_THEME_CLASS[option.value] || ''} ${selectedBillMethod === option.value ? 'is-selected' : ''}`}
+                      type="button"
+                      onClick={() => setSelectedBillMethod(option.value)}
+                      disabled={Boolean(submittingRequestType)}
+                    >
+                      <div className="bill-method-choice-top">
+                        <span className="bill-method-choice-icon">
+                          <OptionIcon size={22} />
+                        </span>
+                        <span className="bill-method-choice-copy">
+                          <strong>{option.label}</strong>
+                          <span className="bill-method-choice-meta">
+                            {BILL_METHOD_META_COPY[option.value] || 'Cobro'}
+                          </span>
+                        </span>
+                        {selectedBillMethod === option.value && (
+                          <span className="bill-method-choice-check" aria-hidden="true">
+                            <Check size={16} />
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                  );
+                })()
+              ))}
+            </div>
             <div className="table-confirm-modal-actions">
-              <button className="btn" type="button" onClick={() => setIsBillConfirmOpen(false)}>
+              {canCancelBillRequest && (
+                <button
+                  className="btn"
+                  type="button"
+                  onClick={() => {
+                    setIsBillConfirmOpen(false);
+                    cancelTableRequest('request_bill');
+                  }}
+                  disabled={Boolean(submittingRequestType)}
+                >
+                  <X size={16} />
+                  Cancelar pedido
+                </button>
+              )}
+              <button className="btn" type="button" onClick={() => setIsBillConfirmOpen(false)} disabled={Boolean(submittingRequestType)}>
+                <X size={16} />
                 Cancelar
               </button>
-              <button className="btn btn-primary" type="button" onClick={confirmBillRequest}>
-                Sí, pedir la cuenta
+              <button className="btn btn-primary" type="button" onClick={confirmBillRequest} disabled={Boolean(submittingRequestType)}>
+                {selectedBillMethod === 'mercado_pago' ? <Wallet size={16} /> : <Receipt size={16} />}
+                {submittingRequestType === 'request_bill'
+                  ? 'Guardando...'
+                  : isBillRequested
+                    ? selectedBillMethod === 'mercado_pago'
+                      ? 'Cambiar a Mercado Pago'
+                      : 'Actualizar método'
+                    : selectedBillMethod === 'mercado_pago'
+                      ? 'Pagar con Mercado Pago'
+                      : 'Pedir la cuenta'}
               </button>
             </div>
           </div>
