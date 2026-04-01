@@ -353,6 +353,12 @@ function decorateSuborderWithOrder(suborder, order) {
   };
 }
 
+function decorateOrderSuborders(order) {
+  return (order?.suborders || [])
+    .map((suborder) => decorateSuborderWithOrder(suborder, order))
+    .filter(Boolean);
+}
+
 function formatExternalCheckoutStatusLabel(value) {
   return EXTERNAL_CHECKOUT_STATUS_LABELS[value] || value || 'Sin estado';
 }
@@ -1505,6 +1511,17 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
       setOrders(prev => [order, ...prev.filter(existingOrder => existingOrder.id !== order.id)]);
       setOrdersStatus('ready');
       setOrdersError('');
+      setSuborders((previous) => {
+        const nextSuborders = decorateOrderSuborders(order);
+
+        if (nextSuborders.length === 0) {
+          return previous;
+        }
+
+        return nextSuborders.reduce((accumulator, suborder) => upsertSuborder(accumulator, suborder), previous);
+      });
+      setSubordersStatus('ready');
+      setSubordersError('');
       setPaymentDrafts((current) => ({
         ...current,
         [order.id]: {
@@ -1560,11 +1577,24 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
         setOrdersStatus(nextOrders.length > 0 ? 'ready' : 'empty');
         return nextOrders;
       });
-      setSuborders((previous) => (
-        order?.closed_at
-          ? previous.filter((existingSuborder) => existingSuborder.order_id !== order.id)
-          : previous
-      ));
+      setSuborders((previous) => {
+        if (order?.closed_at) {
+          return previous.filter((existingSuborder) => existingSuborder.order_id !== order.id);
+        }
+
+        const nextOrderSuborders = decorateOrderSuborders(order);
+
+        if (nextOrderSuborders.length === 0) {
+          return previous;
+        }
+
+        let nextSuborders = previous.filter((existingSuborder) => existingSuborder.order_id !== order.id);
+        nextOrderSuborders.forEach((suborder) => {
+          nextSuborders = upsertSuborder(nextSuborders, suborder);
+        });
+
+        return nextSuborders;
+      });
       setPaymentDrafts((current) => {
         if (order?.closed_at) {
           const nextDrafts = { ...current };
