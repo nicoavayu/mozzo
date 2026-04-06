@@ -1,6 +1,18 @@
 const VALID_SUBORDER_STATUSES = new Set(['pending', 'processing', 'ready', 'delivered', 'cancelled']);
 const ACTIVE_SUBORDER_STATUSES = ['pending', 'processing', 'ready', 'delivered'];
 const MAX_COMMENT_LENGTH = 250;
+const {
+  MONEY_EPSILON,
+  listPaymentsForOrder,
+  roundMoney,
+  summarizeOrderPayments,
+} = require('./order-payments');
+const {
+  calculateSuborderTotal,
+  createSuborderCancellationAdjustment,
+  getSuborderCancellationAdjustmentForSuborder,
+  normalizeAdjustmentReason,
+} = require('./order-charge-adjustments');
 
 function createSuborderError(code, message, status = 400, extra = {}) {
   const error = new Error(message);
@@ -126,6 +138,7 @@ function mapSuborderRows(rows) {
         ready_at: row.ready_at || null,
         delivered_at: row.delivered_at || null,
         cancelled_at: row.cancelled_at || null,
+        cancelled_by: row.cancelled_by || null,
         items: [],
       });
     }
@@ -241,6 +254,7 @@ async function listSubordersForOrderIds(database, orderIds = []) {
         os.ready_at,
         os.delivered_at,
         os.cancelled_at,
+        os.cancelled_by,
         osi.id AS suborder_item_id,
         osi.item_id,
         osi.quantity,
@@ -291,6 +305,7 @@ async function getSuborderById(database, suborderId) {
         os.ready_at,
         os.delivered_at,
         os.cancelled_at,
+        os.cancelled_by,
         osi.id AS suborder_item_id,
         osi.item_id,
         osi.quantity,
@@ -474,9 +489,165 @@ async function appendSuborderToActiveOrder(database, tableId, payload = {}) {
   return suborder;
 }
 
-async function updateSuborderStatus(database, suborderId, nextStatus) {
+async function getOrderFinancialContextForCancellation(database, orderId) {
+  const normalizedOrderId = ensurePositiveInteger(orderId, 'order_id');
+  const row = await database.get(
+    `
+      SELECT
+        o.id,
+        o.closed_at,
+        o.bill_requested_at,
+        ROUND(
+          COALESCE((
+            SELECT SUM(oi.quantity * oi.unit_price)
+            FROM order_items oi
+            WHERE oi.order_id = o.id
+          ), 0)
+          + COALESCE((
+            SELECT SUM(oca.amount_delta)
+            FROM order_charge_adjustments oca
+            WHERE oca.order_id = o.id
+          ), 0),
+          2
+        ) AS total_amount,
+        EXISTS(
+          SELECT 1
+          FROM order_bill_splits obs
+          WHERE obs.order_id = o.id
+          LIMIT 1
+        ) AS has_split_bill
+      FROM orders o
+      WHERE o.id = ?
+    `,
+    [normalizedOrderId]
+  );
+
+  if (!row) {
+    return null;
+  }
+
+  const payments = await listPaymentsForOrder(database, normalizedOrderId);
+  const paymentSummary = summarizeOrderPayments(
+    {
+      id: row.id,
+      total_amount: roundMoney(row.total_amount || 0),
+      closed_at: row.closed_at,
+    },
+    payments
+  );
+
+  return {
+    id: row.id,
+    closed_at: row.closed_at,
+    bill_requested_at: row.bill_requested_at,
+    total_amount: roundMoney(row.total_amount || 0),
+    has_split_bill: Number(row.has_split_bill) > 0,
+    has_payments: payments.length > 0,
+    amount_paid: roundMoney(paymentSummary.amount_paid || 0),
+    payment_status: paymentSummary.payment_status,
+  };
+}
+
+async function cancelSuborder(database, suborderId, options = {}) {
+  const normalizedSuborderId = ensurePositiveInteger(suborderId, 'suborder_id');
+  const currentSuborder = await getSuborderById(database, normalizedSuborderId);
+
+  if (!currentSuborder) {
+    throw createSuborderError('SUBORDER_NOT_FOUND', 'No encontramos ese subpedido.', 404);
+  }
+
+  const orderContext = await getOrderFinancialContextForCancellation(database, currentSuborder.order_id);
+
+  if (!orderContext) {
+    throw createSuborderError('ORDER_NOT_FOUND', 'No encontramos la cuenta de este subpedido.', 404);
+  }
+
+  if (orderContext.closed_at) {
+    throw createSuborderError('ORDER_ALREADY_CLOSED', 'La cuenta ya fue cerrada para esta mesa.', 409);
+  }
+
+  if (currentSuborder.status === 'cancelled') {
+    throw createSuborderError('SUBORDER_ALREADY_CANCELLED', 'Ese subpedido ya fue cancelado.', 409);
+  }
+
+  if (currentSuborder.status === 'delivered') {
+    throw createSuborderError('SUBORDER_ALREADY_DELIVERED', 'No podés cancelar un subpedido ya entregado.', 409);
+  }
+
+  if (!['pending', 'processing', 'ready'].includes(currentSuborder.status)) {
+    throw createSuborderError('SUBORDER_CANCELLATION_NOT_ALLOWED', 'Ese subpedido ya no se puede cancelar.', 409);
+  }
+
+  if (orderContext.bill_requested_at) {
+    throw createSuborderError(
+      'SUBORDER_CANCELLATION_BLOCKED_BY_BILL_FLOW',
+      'No podés cancelar un subpedido después de pedir la cuenta.',
+      409
+    );
+  }
+
+  if (orderContext.has_payments || orderContext.amount_paid > MONEY_EPSILON) {
+    throw createSuborderError(
+      'SUBORDER_CANCELLATION_BLOCKED_BY_PAYMENTS',
+      'No podés cancelar un subpedido si la cuenta ya tiene pagos registrados.',
+      409
+    );
+  }
+
+  if (orderContext.has_split_bill) {
+    throw createSuborderError(
+      'SUBORDER_CANCELLATION_BLOCKED_BY_SPLIT_BILL',
+      'No podés cancelar un subpedido mientras la cuenta tenga una división activa.',
+      409
+    );
+  }
+
+  const existingCancellationAdjustment = await getSuborderCancellationAdjustmentForSuborder(database, normalizedSuborderId);
+  if (existingCancellationAdjustment) {
+    throw createSuborderError(
+      'SUBORDER_CANCELLATION_ALREADY_APPLIED',
+      'Ese subpedido ya tiene un ajuste de cancelación registrado.',
+      409
+    );
+  }
+
+  const suborderTotal = calculateSuborderTotal(currentSuborder);
+  const cancellationReason = normalizeAdjustmentReason(options?.reason);
+  const cancelledBy = options?.cancelled_by == null ? null : String(options.cancelled_by).trim() || null;
+
+  await createSuborderCancellationAdjustment(database, {
+    order_id: currentSuborder.order_id,
+    suborder_id: currentSuborder.id,
+    type: 'suborder_cancellation',
+    amount_delta: roundMoney(-1 * suborderTotal),
+    reason: cancellationReason,
+    created_by: cancelledBy,
+  });
+
+  await database.run(
+    `
+      UPDATE order_suborders
+      SET
+        status = 'cancelled',
+        cancelled_at = COALESCE(cancelled_at, CURRENT_TIMESTAMP),
+        cancelled_by = COALESCE(cancelled_by, ?)
+      WHERE id = ?
+    `,
+    [cancelledBy, normalizedSuborderId]
+  );
+
+  await syncOrderStatusFromSuborders(database, currentSuborder.order_id);
+  return getSuborderById(database, normalizedSuborderId);
+}
+
+async function updateSuborderStatus(database, suborderId, nextStatus, options = {}) {
   const normalizedSuborderId = ensurePositiveInteger(suborderId, 'suborder_id');
   const normalizedStatus = normalizeSuborderStatus(nextStatus);
+
+  if (normalizedStatus === 'cancelled') {
+    return cancelSuborder(database, normalizedSuborderId, options);
+  }
+
   const currentSuborder = await database.get(
     `
       SELECT
@@ -507,7 +678,8 @@ async function updateSuborderStatus(database, suborderId, nextStatus) {
       SET
         status = ?,
         processing_started_at = COALESCE(processing_started_at, CURRENT_TIMESTAMP),
-        cancelled_at = NULL
+        cancelled_at = NULL,
+        cancelled_by = NULL
       WHERE id = ?
     `,
     ready: `
@@ -516,7 +688,8 @@ async function updateSuborderStatus(database, suborderId, nextStatus) {
         status = ?,
         processing_started_at = COALESCE(processing_started_at, CURRENT_TIMESTAMP),
         ready_at = COALESCE(ready_at, CURRENT_TIMESTAMP),
-        cancelled_at = NULL
+        cancelled_at = NULL,
+        cancelled_by = NULL
       WHERE id = ?
     `,
     delivered: `
@@ -526,20 +699,14 @@ async function updateSuborderStatus(database, suborderId, nextStatus) {
         processing_started_at = COALESCE(processing_started_at, CURRENT_TIMESTAMP),
         ready_at = COALESCE(ready_at, CURRENT_TIMESTAMP),
         delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP),
-        cancelled_at = NULL
-      WHERE id = ?
-    `,
-    cancelled: `
-      UPDATE order_suborders
-      SET
-        status = ?,
-        cancelled_at = COALESCE(cancelled_at, CURRENT_TIMESTAMP)
+        cancelled_at = NULL,
+        cancelled_by = NULL
       WHERE id = ?
     `,
   };
 
   await database.run(
-    updateStatements[normalizedStatus] || 'UPDATE order_suborders SET status = ?, cancelled_at = NULL WHERE id = ?',
+    updateStatements[normalizedStatus] || 'UPDATE order_suborders SET status = ?, cancelled_at = NULL, cancelled_by = NULL WHERE id = ?',
     [normalizedStatus, normalizedSuborderId]
   );
 
@@ -561,6 +728,7 @@ async function listOpenSuborders(database) {
         os.ready_at,
         os.delivered_at,
         os.cancelled_at,
+        os.cancelled_by,
         o.bill_requested_at,
         osi.id AS suborder_item_id,
         osi.item_id,
@@ -598,6 +766,7 @@ module.exports = {
   listSubordersForOrderIds,
   normalizeSuborderItemsPayload,
   summarizeSuborders,
+  cancelSuborder,
   syncOrderStatusFromSuborders,
   updateSuborderStatus,
 };

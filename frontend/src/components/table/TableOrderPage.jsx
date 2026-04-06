@@ -5,6 +5,12 @@ import { formatBillCollectionStatusLabel, formatBillPaymentMethodLabel } from '.
 import { getSuborderLabel, getSuborderStatusDescriptor, sortSuborders } from '../../lib/suborders';
 import OrderConfirmedModal from './OrderConfirmedModal';
 
+const MERCADO_PAGO_MOCK_OPTIONS = [
+  { value: 'approved', label: 'Approved' },
+  { value: 'pending', label: 'Pending' },
+  { value: 'failed', label: 'Failed' },
+];
+
 export default function TableOrderPage() {
   const {
     tableId,
@@ -17,7 +23,11 @@ export default function TableOrderPage() {
     activeOrderCustomerStatus,
     billPaymentMethodPreference,
     billCollectionStatus,
+    billSplitChoiceLabel,
     canPayWithMercadoPago,
+    mercadoPagoMockMode,
+    mercadoPagoMockResult,
+    mercadoPagoCheckoutState,
     startingMercadoPagoCheckout,
     startMercadoPagoCheckout,
     mercadoPagoActionError,
@@ -40,11 +50,22 @@ export default function TableOrderPage() {
     placeOrder,
     reloadSession,
     clearOrderStatusFeedback,
+    setMercadoPagoMockResult,
   } = useOutletContext();
 
   const hasDraft = cartItemsCount > 0 && !isDraftLocked;
   const hasActiveOrder = Boolean(activeOrder);
   const sortedSuborders = sortSuborders(activeOrder?.suborders || []);
+  const shouldShowMercadoPagoState = Boolean(
+    activeOrder?.bill_requested_at
+    && billPaymentMethodPreference === 'mercado_pago'
+    && (
+      canPayWithMercadoPago
+      || mercadoPagoCheckoutState?.isApproved
+      || mercadoPagoCheckoutState?.hasPendingCheckout
+      || mercadoPagoCheckoutState?.hasFailure
+    )
+  );
 
   if (activeOrderStatus === 'loading' && !hasActiveOrder && !hasDraft) {
     return <div className="loader"></div>;
@@ -159,22 +180,56 @@ export default function TableOrderPage() {
                 Método elegido: {formatBillPaymentMethodLabel(billPaymentMethodPreference)} · {formatBillCollectionStatusLabel(billCollectionStatus)}
               </div>
             )}
+            {activeOrder.bill_requested_at && billSplitChoiceLabel && (
+              <div className="table-order-summary-secondary">
+                {billSplitChoiceLabel}
+              </div>
+            )}
           </div>
-          {canPayWithMercadoPago && (
+          {shouldShowMercadoPagoState && (
             <div className="order-payment-cta">
               <div>
-                <strong>Pagar desde Mozzo</strong>
-                <span>Podés saldar la mesa online con Mercado Pago por {formatMoney(activeOrderAmountDue)}.</span>
+                <strong>{mercadoPagoCheckoutState?.title || 'Pagar ahora'}</strong>
+                <span>
+                  {mercadoPagoCheckoutState?.message || `Podés saldar la mesa online con Mercado Pago por ${formatMoney(activeOrderAmountDue)}.`}
+                  {activeOrderAmountDue > 0
+                    ? ` Saldo actual ${formatMoney(activeOrderAmountDue)}.`
+                    : mercadoPagoCheckoutState?.isApproved
+                      ? ' La cuenta ya quedó saldada.'
+                  : ''}
+                </span>
               </div>
-              <button
-                className="btn btn-primary"
-                type="button"
-                onClick={startMercadoPagoCheckout}
-                disabled={startingMercadoPagoCheckout}
-              >
-                <Wallet size={18} />
-                {startingMercadoPagoCheckout ? 'Abriendo Mercado Pago...' : 'Pagar con Mercado Pago'}
-              </button>
+              {mercadoPagoMockMode && activeOrderAmountDue > 0 ? (
+                <div className="mercado-pago-mock-controls">
+                  <span className="mercado-pago-mock-label">Modo local</span>
+                  <div className="mercado-pago-mock-options">
+                    {MERCADO_PAGO_MOCK_OPTIONS.map((option) => (
+                      <button
+                        key={`mock-order-${option.value}`}
+                        className={`btn ${mercadoPagoMockResult === option.value ? 'btn-primary' : ''}`}
+                        type="button"
+                        onClick={() => setMercadoPagoMockResult(option.value)}
+                        disabled={startingMercadoPagoCheckout}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+              {activeOrderAmountDue > 0 ? (
+                <button
+                  className="btn btn-primary"
+                  type="button"
+                  onClick={startMercadoPagoCheckout}
+                  disabled={startingMercadoPagoCheckout}
+                >
+                  <Wallet size={18} />
+                  {startingMercadoPagoCheckout
+                    ? 'Abriendo Mercado Pago...'
+                    : mercadoPagoCheckoutState?.actionLabel || 'Pagar ahora'}
+                </button>
+              ) : null}
             </div>
           )}
           {(mercadoPagoActionError || mercadoPagoFeedback) && (

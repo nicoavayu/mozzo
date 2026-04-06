@@ -19,6 +19,29 @@ export const BILL_PAYMENT_METHOD_OPTIONS = [
   },
 ];
 
+export const BILL_SPLIT_OPTIONS = [
+  {
+    value: 1,
+    label: 'No dividir',
+    customer_description: 'Una sola cuenta para la mesa.',
+  },
+  {
+    value: 2,
+    label: 'Dividir entre 2',
+    customer_description: 'Preparamos la cuenta en 2 partes iguales.',
+  },
+  {
+    value: 3,
+    label: 'Dividir entre 3',
+    customer_description: 'Preparamos la cuenta en 3 partes iguales.',
+  },
+  {
+    value: 4,
+    label: 'Dividir entre 4',
+    customer_description: 'Preparamos la cuenta en 4 partes iguales.',
+  },
+];
+
 export const BILL_PAYMENT_METHOD_LABELS = Object.fromEntries(
   BILL_PAYMENT_METHOD_OPTIONS.map((option) => [option.value, option.label])
 );
@@ -42,4 +65,33 @@ export function formatBillCollectionStatusLabel(value) {
 
 export function getBillPaymentOption(value) {
   return BILL_PAYMENT_METHOD_OPTIONS.find((option) => option.value === value) || null;
+}
+
+export function normalizeBillSplitChoice(value) {
+  const numericValue = Number(value);
+
+  if (!Number.isInteger(numericValue) || numericValue <= 1) {
+    return 1;
+  }
+
+  if ([2, 3, 4].includes(numericValue)) {
+    return numericValue;
+  }
+
+  return 1;
+}
+
+export function formatBillSplitChoiceLabel(value) {
+  const normalizedValue = normalizeBillSplitChoice(value);
+
+  if (normalizedValue <= 1) {
+    return 'Cuenta sin dividir';
+  }
+
+  return `Cuenta dividida entre ${normalizedValue} ${normalizedValue === 1 ? 'persona' : 'personas'}`;
+}
+
+export function getBillSplitOption(value) {
+  const normalizedValue = normalizeBillSplitChoice(value);
+  return BILL_SPLIT_OPTIONS.find((option) => option.value === normalizedValue) || BILL_SPLIT_OPTIONS[0];
 }

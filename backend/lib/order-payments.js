@@ -2,6 +2,10 @@ const VALID_PAYMENT_METHODS = new Set(['cash', 'card', 'transfer', 'other', 'mer
 const MAX_PAYMENT_NOTE_LENGTH = 250;
 const MAX_PAYMENT_REVERSAL_REASON_LENGTH = 500;
 const MONEY_EPSILON = 0.009;
+const {
+  recordCashRefundMovement,
+  recordCashSaleMovement,
+} = require('./cash-register-movements');
 
 function createOrderPaymentError(code, message, status = 400, extra = {}) {
   const error = new Error(message);
@@ -530,7 +534,19 @@ async function createPaymentForOrder(database, payload) {
     [orderId, cashRegisterSessionId, amount, method, note, createdBy]
   );
 
-  return getRawPaymentById(database, result.lastID);
+  const payment = await getRawPaymentById(database, result.lastID);
+
+  if (payment?.method === 'cash' && payment.cash_register_session_id) {
+    await recordCashSaleMovement(database, {
+      session_id: payment.cash_register_session_id,
+      order_payment_id: payment.id,
+      amount: payment.amount,
+      reason: note || 'Pago en efectivo',
+      created_by: payment.created_by,
+    });
+  }
+
+  return payment;
 }
 
 async function createPaymentReversalForPayment(database, payload) {
@@ -575,7 +591,23 @@ async function createPaymentReversalForPayment(database, payload) {
     [result.lastID]
   );
 
-  return mapOrderPaymentReversalRow(row);
+  const reversal = mapOrderPaymentReversalRow(row);
+
+  if (reversal?.cash_register_session_id) {
+    const payment = await getRawPaymentById(database, orderPaymentId);
+
+    if (payment?.method === 'cash') {
+      await recordCashRefundMovement(database, {
+        session_id: reversal.cash_register_session_id,
+        order_payment_reversal_id: reversal.id,
+        amount: reversal.amount,
+        reason: reversal.reason || 'Reversión en efectivo',
+        created_by: reversal.created_by,
+      });
+    }
+  }
+
+  return reversal;
 }
 
 async function getPaymentById(database, paymentId) {

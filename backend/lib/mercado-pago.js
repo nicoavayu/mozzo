@@ -17,6 +17,7 @@ const { getOpenRegister } = require('./cash-register');
 
 const CHECKOUT_TTL_MINUTES = 15;
 const MERCADO_PAGO_METHOD = 'mercado_pago';
+const VALID_MOCK_RESULTS = new Set(['approved', 'pending', 'failed']);
 const ACTIVE_CHECKOUT_STATUSES = new Set(['pending']);
 const ACTIVE_CHECKOUT_DISPOSITIONS = new Set(['pending']);
 const CHECKOUT_STATUSES = new Set([
@@ -198,6 +199,24 @@ function buildExternalReference() {
 
 function buildMockPaymentId(externalReference) {
   return `mock_payment_${externalReference}`;
+}
+
+function normalizeMockResult(value) {
+  const normalizedValue = String(value || '').trim().toLowerCase();
+
+  if (!normalizedValue) {
+    return 'approved';
+  }
+
+  if (!VALID_MOCK_RESULTS.has(normalizedValue)) {
+    throw createMercadoPagoError(
+      'INVALID_MERCADO_PAGO_MOCK_RESULT',
+      'El resultado mock de Mercado Pago es inválido.',
+      400
+    );
+  }
+
+  return normalizedValue;
 }
 
 function buildReturnUrl(result, externalReference) {
@@ -513,7 +532,13 @@ async function markCheckoutStale(database, checkout, payment, reason, eventSourc
   );
 }
 
-async function markObsoletePendingCheckoutsForOrder(database, orderId, currentAmount, eventSource = 'checkout_create') {
+async function markObsoletePendingCheckoutsForOrder(
+  database,
+  orderId,
+  currentAmount,
+  eventSource = 'checkout_create',
+  options = {}
+) {
   const normalizedOrderId = ensurePositiveInteger(orderId, 'order_id');
   const rows = await database.all(
     `
@@ -531,7 +556,7 @@ async function markObsoletePendingCheckoutsForOrder(database, orderId, currentAm
     const checkout = mapCheckoutRow(row);
     const sameAmount = Math.abs(Number(checkout.amount || 0) - Number(currentAmount || 0)) <= MONEY_EPSILON;
 
-    if (sameAmount && !isCheckoutExpired(checkout)) {
+    if (!options.force && sameAmount && !isCheckoutExpired(checkout)) {
       continue;
     }
 
@@ -568,8 +593,20 @@ function ensureOrderCanStartCheckout(order) {
     throw createOrderError('ORDER_NOT_DELIVERED', 'El pedido todavía no fue entregado.', 409);
   }
 
+  if (!order.bill_requested_at) {
+    throw createOrderError('BILL_NOT_REQUESTED', 'Primero tenés que pedir la cuenta para iniciar el pago online.', 409);
+  }
+
   if (!order.bill_attended_at) {
     throw createOrderError('BILL_NOT_ATTENDED', 'La cuenta todavía no fue entregada.', 409);
+  }
+
+  if (order.bill_payment_method_preference !== MERCADO_PAGO_METHOD) {
+    throw createOrderError(
+      'BILL_METHOD_NOT_MERCADO_PAGO',
+      'La mesa no eligió Mercado Pago para esta cuenta.',
+      409
+    );
   }
 
   if (Number(order.amount_due || 0) <= MONEY_EPSILON) {
@@ -577,9 +614,12 @@ function ensureOrderCanStartCheckout(order) {
   }
 }
 
-async function createMercadoPagoPreference({ externalReference, order, amount, restaurantName }) {
+async function createMercadoPagoPreference({ externalReference, order, amount, restaurantName, mockResult = 'approved' }) {
   if (isMercadoPagoMockMode()) {
-    const initPoint = `${buildReturnUrl('success', externalReference)}&payment_id=${encodeURIComponent(buildMockPaymentId(externalReference))}`;
+    const normalizedMockResult = normalizeMockResult(mockResult);
+    const returnStatus = normalizedMockResult === 'failed' ? 'failure' : normalizedMockResult;
+    const mockPaymentId = `mock_payment__status=${normalizedMockResult}__amount=${roundMoney(amount)}__external_reference=${externalReference}`;
+    const initPoint = `${buildReturnUrl(returnStatus, externalReference)}&payment_id=${encodeURIComponent(mockPaymentId)}`;
 
     return {
       id: `mock_pref_${externalReference}`,
@@ -632,12 +672,17 @@ async function createCheckoutForTable(database, tableId, options = {}) {
   const activeOrder = await getActiveOrderForTable(database, tableId);
   ensureOrderCanStartCheckout(activeOrder);
   const amount = roundMoney(activeOrder.amount_due);
+  const mockResult = isMercadoPagoMockMode() ? normalizeMockResult(options.mock_result) : null;
 
-  await markObsoletePendingCheckoutsForOrder(database, activeOrder.id, amount, 'checkout_create');
+  await markObsoletePendingCheckoutsForOrder(database, activeOrder.id, amount, 'checkout_create', {
+    force: Boolean(mockResult),
+  });
 
-  const reusableCheckout = await findReusablePendingCheckout(database, activeOrder.id, amount);
-  if (reusableCheckout) {
-    return reusableCheckout;
+  if (!mockResult) {
+    const reusableCheckout = await findReusablePendingCheckout(database, activeOrder.id, amount);
+    if (reusableCheckout) {
+      return reusableCheckout;
+    }
   }
 
   const externalReference = buildExternalReference();
@@ -646,6 +691,7 @@ async function createCheckoutForTable(database, tableId, options = {}) {
     order: activeOrder,
     amount,
     restaurantName: options.restaurant_name,
+    mockResult,
   });
   const expiresAt = preference.date_of_expiration || preference.expiration_date_to || preference.expires_at || new Date(Date.now() + CHECKOUT_TTL_MINUTES * 60 * 1000).toISOString();
 

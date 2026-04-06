@@ -1,9 +1,12 @@
 import { useState } from 'react';
 import { ChefHat, LogIn, Moon, Sun } from 'lucide-react';
-import { loginAdmin } from '../lib/adminAuth';
+import { loginAdmin, loginStaff } from '../lib/adminAuth';
 
 export default function AdminLogin({ onLogin, venueSettings, theme, onToggleTheme }) {
+  const [mode, setMode] = useState('owner');
   const [password, setPassword] = useState('');
+  const [loginCode, setLoginCode] = useState('');
+  const [pin, setPin] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const isLight = theme === 'light';
@@ -14,7 +17,9 @@ export default function AdminLogin({ onLogin, venueSettings, theme, onToggleThem
     setError('');
 
     try {
-      const token = await loginAdmin(password);
+      const token = mode === 'owner'
+        ? await loginAdmin(password)
+        : await loginStaff(loginCode, pin);
       onLogin(token);
     } catch (loginError) {
       setError(loginError.message);
@@ -42,18 +47,67 @@ export default function AdminLogin({ onLogin, venueSettings, theme, onToggleThem
           <ChefHat size={32} color="var(--accent-color)" />
           <div>
             <h1 className="admin-auth-title">{venueSettings.restaurant_name} Admin</h1>
-            <p className="admin-auth-copy">{venueSettings.restaurant_subtitle || 'Ingresá la clave de administración.'}</p>
+            <p className="admin-auth-copy">
+              {mode === 'owner'
+                ? (venueSettings.restaurant_subtitle || 'Ingresá la clave de administración.')
+                : 'Ingresá tu código y PIN operativo.'}
+            </p>
           </div>
         </div>
 
         <form onSubmit={handleSubmit} className="admin-auth-form">
-          <input
-            className="admin-input admin-input--compact"
-            type="password"
-            placeholder="Contraseña de admin"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-          />
+          <div className="admin-auth-mode-switch">
+            <button
+              className={`btn ${mode === 'owner' ? 'btn-primary' : ''}`}
+              type="button"
+              onClick={() => {
+                setMode('owner');
+                setError('');
+              }}
+            >
+              Owner
+            </button>
+            <button
+              className={`btn ${mode === 'staff' ? 'btn-primary' : ''}`}
+              type="button"
+              onClick={() => {
+                setMode('staff');
+                setError('');
+              }}
+            >
+              Staff
+            </button>
+          </div>
+
+          {mode === 'owner' ? (
+            <input
+              className="admin-input admin-input--compact"
+              type="password"
+              placeholder="Contraseña de admin"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+            />
+          ) : (
+            <>
+              <input
+                className="admin-input admin-input--compact"
+                type="text"
+                placeholder="Código de acceso"
+                value={loginCode}
+                onChange={(event) => setLoginCode(event.target.value.toUpperCase())}
+                autoCapitalize="characters"
+                autoCorrect="off"
+              />
+              <input
+                className="admin-input admin-input--compact"
+                type="password"
+                placeholder="PIN"
+                value={pin}
+                onChange={(event) => setPin(event.target.value)}
+                inputMode="numeric"
+              />
+            </>
+          )}
 
           {error && (
             <div className="admin-auth-error">
@@ -61,7 +115,11 @@ export default function AdminLogin({ onLogin, venueSettings, theme, onToggleThem
             </div>
           )}
 
-          <button className="btn btn-primary" type="submit" disabled={submitting || !password}>
+          <button
+            className="btn btn-primary"
+            type="submit"
+            disabled={submitting || (mode === 'owner' ? !password : !loginCode || !pin)}
+          >
             {submitting ? 'Ingresando...' : <><LogIn size={18} /> Entrar</>}
           </button>
         </form>

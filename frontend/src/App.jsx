@@ -8,7 +8,7 @@ import TableMenuPage from './components/table/TableMenuPage';
 import TableOrderPage from './components/table/TableOrderPage';
 import { apiRequest } from './lib/api';
 import { socket } from './lib/socket';
-import { clearAdminToken, getAdminToken } from './lib/adminAuth';
+import { clearAdminToken, getAdminToken, logoutAdminSession } from './lib/adminAuth';
 import { DEFAULT_VENUE_SETTINGS, normalizeVenueSettings } from './lib/venueSettings';
 
 function AdminRoute({ venueSettings, onVenueSettingsSaved }) {
@@ -31,8 +31,13 @@ function AdminRoute({ venueSettings, onVenueSettingsSaved }) {
   }, [adminTheme]);
 
   const handleLogout = () => {
-    clearAdminToken();
-    setAdminToken(null);
+    const token = adminToken;
+    Promise.resolve(token ? logoutAdminSession(token) : null).catch(() => {
+      clearAdminToken();
+    }).finally(() => {
+      clearAdminToken();
+      setAdminToken(null);
+    });
   };
 
   if (!adminToken) {

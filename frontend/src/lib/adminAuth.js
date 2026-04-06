@@ -27,3 +27,31 @@ export async function loginAdmin(password) {
   setAdminToken(data.token);
   return data.token;
 }
+
+export async function loginStaff(loginCode, pin) {
+  const data = await apiRequest('/api/admin/staff/sessions', {
+    method: 'POST',
+    body: {
+      login_code: loginCode,
+      pin,
+    }
+  });
+
+  setAdminToken(data.token);
+  return data.token;
+}
+
+export async function readCurrentAdminSession(token) {
+  return apiRequest('/api/admin/session/current', { token });
+}
+
+export async function logoutAdminSession(token) {
+  try {
+    await apiRequest('/api/admin/session/current', {
+      method: 'DELETE',
+      token,
+    });
+  } finally {
+    clearAdminToken();
+  }
+}

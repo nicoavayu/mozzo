@@ -1,7 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { apiRequest } from '../lib/api';
-import { formatBillPaymentMethodLabel } from '../lib/billFlow';
-import { getMercadoPagoReturnFeedback, normalizeMercadoPagoReturnStatus } from '../lib/mercadoPago';
+import {
+  formatBillPaymentMethodLabel,
+  formatBillSplitChoiceLabel,
+  normalizeBillSplitChoice,
+} from '../lib/billFlow';
+import {
+  getMercadoPagoCheckoutState,
+  getMercadoPagoReturnFeedback,
+  normalizeMercadoPagoReturnStatus,
+} from '../lib/mercadoPago';
 import { getCustomerActiveOrderStatus } from '../lib/orderStatus';
 export { ACTIVE_ORDER_STATUS_LABELS } from '../lib/orderStatus';
 import { summarizeActiveOrderSession } from '../lib/suborders';
@@ -79,18 +87,27 @@ function buildUnavailableItemsFeedback(items = []) {
   return `Quitamos ${uniqueItems.length} productos porque ya no están disponibles.`;
 }
 
-function buildBillRequestSuccessMessage(method, { online = false, alreadyPending = false } = {}) {
+function buildBillRequestSuccessMessage(
+  method,
+  {
+    online = false,
+    alreadyPending = false,
+    splitCount = 1,
+  } = {}
+) {
+  const splitLabel = formatBillSplitChoiceLabel(splitCount).toLowerCase();
+
   if (online || method === 'mercado_pago') {
     return alreadyPending
-      ? 'Mercado Pago ya estaba seleccionado para esta mesa. Podés continuar el checkout online.'
-      : 'Abrimos Mercado Pago para que puedas pagar desde el celular.';
+      ? `Mercado Pago ya estaba seleccionado para esta mesa. ${splitLabel}. Podés continuar el pago desde “Pagar ahora”.`
+      : `Dejamos Mercado Pago listo para esta mesa. ${splitLabel}. Cuando quieras, tocá “Pagar ahora”.`;
   }
 
   const methodLabel = formatBillPaymentMethodLabel(method).toLowerCase();
 
   return alreadyPending
-    ? `Actualizamos la cuenta para cobrar ${methodLabel} en la mesa.`
-    : `Avisamos al salón que querés pagar ${methodLabel}.`;
+    ? `Actualizamos la cuenta para cobrar ${methodLabel} en la mesa. ${splitLabel}.`
+    : `Avisamos al salón que querés pagar ${methodLabel}. ${splitLabel}.`;
 }
 
 function upsertTableRequest(list, nextRequest) {
@@ -168,6 +185,8 @@ export default function useTableSession(tableId, socket) {
   const [tableRequestActionError, setTableRequestActionError] = useState('');
   const [submittingRequestType, setSubmittingRequestType] = useState('');
   const [mercadoPagoEnabled, setMercadoPagoEnabled] = useState(false);
+  const [mercadoPagoMockMode, setMercadoPagoMockMode] = useState(false);
+  const [mercadoPagoMockResult, setMercadoPagoMockResult] = useState('approved');
   const [startingMercadoPagoCheckout, setStartingMercadoPagoCheckout] = useState(false);
   const [mercadoPagoActionError, setMercadoPagoActionError] = useState('');
   const [mercadoPagoFeedback, setMercadoPagoFeedback] = useState(null);
@@ -221,6 +240,8 @@ export default function useTableSession(tableId, socket) {
     setTableRequestActionError('');
     setSubmittingRequestType('');
     setMercadoPagoEnabled(false);
+    setMercadoPagoMockMode(false);
+    setMercadoPagoMockResult('approved');
     setStartingMercadoPagoCheckout(false);
     setMercadoPagoActionError('');
     setMercadoPagoFeedback(null);
@@ -487,12 +508,14 @@ export default function useTableSession(tableId, socket) {
         }
 
         setMercadoPagoEnabled(Boolean(data?.enabled));
+        setMercadoPagoMockMode(Boolean(data?.mock_mode));
       } catch {
         if (!isMounted) {
           return;
         }
 
         setMercadoPagoEnabled(false);
+        setMercadoPagoMockMode(false);
       }
     };
 
@@ -612,6 +635,28 @@ export default function useTableSession(tableId, socket) {
       setTableRequestsError('');
     };
 
+    const handleOperationalStateReset = () => {
+      setCart([]);
+      writePersistedDraft(tableId, []);
+      setActiveOrder(null);
+      setLatestOrder(null);
+      setActiveOrderStatus('empty');
+      setActiveOrderError('');
+      setTableRequests([]);
+      setTableRequestsStatus('empty');
+      setTableRequestsError('');
+      setTableRequestFeedback('Reseteamos la demo de la mesa.');
+      setTableRequestActionError('');
+      setOrderConfirmed(false);
+      setOrderError('');
+      setMenuAvailabilityFeedback('');
+      setMercadoPagoActionError('');
+      setMercadoPagoFeedback(null);
+      setOrderStatusFeedback(null);
+      fetchOrderSession({ showLoader: false });
+      fetchTableRequests({ showLoader: false });
+    };
+
     if (!isValidTableId) {
       setMenuStatus('error');
       setMenuError('La mesa solicitada no es válida.');
@@ -638,6 +683,7 @@ export default function useTableSession(tableId, socket) {
     socket.on('suborder_updated', handleSuborderUpdated);
     socket.on('table_request_created', handleTableRequestCreated);
     socket.on('table_request_updated', handleTableRequestUpdated);
+    socket.on('operational_state_reset', handleOperationalStateReset);
     socket.on('connect', handleSocketConnect);
 
     return () => {
@@ -651,6 +697,7 @@ export default function useTableSession(tableId, socket) {
       socket.off('suborder_updated', handleSuborderUpdated);
       socket.off('table_request_created', handleTableRequestCreated);
       socket.off('table_request_updated', handleTableRequestUpdated);
+      socket.off('operational_state_reset', handleOperationalStateReset);
       socket.off('menu_updated', handleMenuUpdated);
     };
   }, [reloadKey, tableId, socket, numericTableId, isValidTableId]);
@@ -785,7 +832,10 @@ export default function useTableSession(tableId, socket) {
       const response = await apiRequest(`/api/tables/${tableId}/${requestConfig.endpoint}`, {
         method: 'POST',
         body: requestType === 'request_bill'
-          ? { preferred_payment_method: payload?.preferred_payment_method }
+          ? {
+              preferred_payment_method: payload?.preferred_payment_method,
+              split_count: payload?.split_count ?? 1,
+            }
           : undefined,
       });
 
@@ -794,6 +844,12 @@ export default function useTableSession(tableId, socket) {
         const nextTableRequest = response?.table_request || null;
         const resolvedRequests = Array.isArray(response?.resolved_requests) ? response.resolved_requests : [];
         const preferredMethod = response?.preferred_payment_method || payload?.preferred_payment_method || 'cash';
+        const splitCount = normalizeBillSplitChoice(
+          response?.split_count
+          ?? response?.order?.bill_splits_summary?.groups?.length
+          ?? payload?.split_count
+          ?? 1
+        );
 
         if (nextOrder) {
           setActiveOrder(nextOrder);
@@ -824,6 +880,7 @@ export default function useTableSession(tableId, socket) {
           buildBillRequestSuccessMessage(preferredMethod, {
             online: Boolean(response?.should_start_online_checkout),
             alreadyPending: Boolean(nextTableRequest?.already_pending),
+            splitCount,
           })
         );
         return response;
@@ -901,13 +958,27 @@ export default function useTableSession(tableId, socket) {
     try {
       const checkout = await apiRequest(`/api/tables/${tableId}/mercado-pago/checkout`, {
         method: 'POST',
+        body: mercadoPagoMockMode
+          ? {
+              mock_result: mercadoPagoMockResult,
+            }
+          : undefined,
       });
 
-      if (!checkout?.checkout_url) {
+      if (checkout?.order) {
+        setActiveOrder(checkout.order);
+        setLatestOrder(checkout.order);
+        setActiveOrderStatus(checkout.order.closed_at ? 'empty' : 'ready');
+        setActiveOrderError('');
+      }
+
+      const checkoutUrl = checkout?.checkout_url || checkout?.sandbox_checkout_url;
+
+      if (!checkoutUrl) {
         throw new Error('No pudimos iniciar Mercado Pago.');
       }
 
-      window.location.assign(checkout.checkout_url);
+      window.location.assign(checkoutUrl);
     } catch (error) {
       setMercadoPagoActionError(error.message);
     } finally {
@@ -947,6 +1018,18 @@ export default function useTableSession(tableId, socket) {
   const activeOrderCustomerStatus = activeOrder ? getCustomerActiveOrderStatus(activeOrder.status) : null;
   const billPaymentMethodPreference = activeOrder?.bill_payment_method_preference || null;
   const billCollectionStatus = activeOrder?.bill_collection_status || null;
+  const billSplitSummary = activeOrder?.bill_splits_summary || null;
+  const billSplitCount = activeOrder?.bill_requested_at
+    ? normalizeBillSplitChoice(
+        billSplitSummary?.has_split_bill ? billSplitSummary?.groups?.length : 1
+      )
+    : null;
+  const billSplitChoiceLabel = billSplitCount == null ? '' : formatBillSplitChoiceLabel(billSplitCount);
+  const isBillSplitLocked = Boolean(
+    activeOrder?.bill_requested_at
+    && billSplitSummary?.has_split_bill
+    && billSplitSummary?.has_assigned_payments
+  );
   const hasMenuItems = categories.some((category) => (category.items || []).length > 0);
   const pendingTableRequests = tableRequests.filter((request) => request.status === 'pending');
   const isDraftLocked = isDraftLockedByActiveOrder(activeOrder);
@@ -969,14 +1052,20 @@ export default function useTableSession(tableId, socket) {
     && activeOrderAmountDue > 0
     && (activeOrder.status === 'delivered' || isBillRequested)
   );
+  const canUpdateBillSplitChoice = Boolean(
+    canManageBillFlow
+    && (!billSplitSummary?.has_split_bill || billSplitSummary?.can_reconfigure)
+  );
   const canPayWithMercadoPago = Boolean(
     mercadoPagoEnabled
     && activeOrder
+    && activeOrder.bill_requested_at
     && activeOrder.bill_attended_at
     && !activeOrder.closed_at
     && activeOrderAmountDue > 0
     && billPaymentMethodPreference === 'mercado_pago'
   );
+  const mercadoPagoCheckoutState = getMercadoPagoCheckoutState(activeOrder);
 
   return {
     tableId,
@@ -1002,6 +1091,9 @@ export default function useTableSession(tableId, socket) {
     activeOrderCustomerStatus,
     billPaymentMethodPreference,
     billCollectionStatus,
+    billSplitSummary,
+    billSplitCount,
+    billSplitChoiceLabel,
     placingOrder,
     orderError,
     orderConfirmed,
@@ -1014,6 +1106,8 @@ export default function useTableSession(tableId, socket) {
     tableRequestActionError,
     submittingRequestType,
     mercadoPagoEnabled,
+    mercadoPagoMockMode,
+    mercadoPagoMockResult,
     startingMercadoPagoCheckout,
     mercadoPagoActionError,
     mercadoPagoFeedback,
@@ -1025,9 +1119,12 @@ export default function useTableSession(tableId, socket) {
     isWaiterRequested,
     isBillRequested,
     isBillAttended,
+    isBillSplitLocked,
     canRequestBill,
     canManageBillFlow,
+    canUpdateBillSplitChoice,
     canPayWithMercadoPago,
+    mercadoPagoCheckoutState,
     addToCart,
     updateQuantity,
     updateComment,
@@ -1039,5 +1136,6 @@ export default function useTableSession(tableId, socket) {
     clearTableRequestMessages,
     clearMercadoPagoMessages,
     clearOrderStatusFeedback,
+    setMercadoPagoMockResult,
   };
 }

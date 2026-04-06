@@ -45,6 +45,12 @@ const {
     updateSuborderStatus,
 } = require('./lib/order-suborders');
 const {
+    assignPaymentToBillSplit,
+    clearBillSplitsForOrder,
+    getOrderBillSplitState,
+    replaceEqualBillSplitsForOrder,
+} = require('./lib/order-bill-splits');
+const {
     createTableRequest,
     getTableRequestById,
     listActiveTableRequestsForTable,
@@ -55,15 +61,28 @@ const {
     resolveTableRequest
 } = require('./lib/table-requests');
 const { listTables, createTable, deleteTable } = require('./lib/tables');
-const { issueAdminToken, verifyAdminPassword, verifyAdminToken } = require('./lib/auth');
-const { requireAdmin } = require('./middleware/requireAdmin');
+const { issueAdminToken, verifyAdminPassword } = require('./lib/auth');
+const { requireAdmin, requireOwner, requirePermission } = require('./middleware/requireAdmin');
+const {
+    assertPermission,
+    createStaffSession,
+    createStaffUser,
+    deleteStaffSessionByToken,
+    formatAuditActor,
+    getCurrentAdminSession,
+    hasPermission,
+    listStaffUsers,
+    resolveAdminActor,
+} = require('./lib/staff');
 const {
     closeRegister,
+    createCurrentRegisterMovement,
     getOpenRegister,
     getRegisterSessionById,
     listRegisterSessions,
     openRegister
 } = require('./lib/cash-register');
+const { resetOperationalDemoState } = require('./lib/demo-reset');
 const {
     buildMercadoPagoReturnRedirect,
     createCheckoutForTable,
@@ -71,6 +90,7 @@ const {
     extractMercadoPagoPaymentId,
     getCheckoutByExternalReference,
     isMercadoPagoConfigured,
+    isMercadoPagoMockMode,
     syncMercadoPagoCheckout,
 } = require('./lib/mercado-pago');
 
@@ -119,8 +139,8 @@ function sendSocketAuthError(socket, error) {
     socket.emit('auth_error', { error: 'Invalid admin token', status: 403 });
 }
 
-function verifySocketAdmin(socket, token) {
-    const admin = verifyAdminToken(token);
+async function verifySocketAdmin(socket, token) {
+    const admin = await resolveAdminActor(database, token);
     socket.data.isAdmin = true;
     socket.data.admin = admin;
     return admin;
@@ -195,6 +215,13 @@ function emitCashRegisterUpdated(session = null) {
     io.to('admin_room').emit('cash_register_updated', session ? { id: session.id, status: session.status } : { status: 'updated' });
 }
 
+function emitOperationalStateReset(payload = {}) {
+    io.emit('operational_state_reset', {
+        reset_at: payload.reset_at || new Date().toISOString(),
+        cleared: payload.cleared || null,
+    });
+}
+
 function sendOrderHttpError(res, error) {
     const status = error.status || 500;
     res.status(status).json({
@@ -204,6 +231,69 @@ function sendOrderHttpError(res, error) {
         amount_due: Number.isFinite(Number(error.amount_due)) ? Number(error.amount_due) : undefined,
         reversible_amount: Number.isFinite(Number(error.reversible_amount)) ? Number(error.reversible_amount) : undefined,
     });
+}
+
+function createPermissionError(message = 'No tenés permiso para hacer eso.') {
+    const error = new Error(message);
+    error.status = 403;
+    error.code = 'FORBIDDEN';
+    return error;
+}
+
+function normalizeTableBillSplitCount(value) {
+    if (value == null || value === '' || Number(value) === 1) {
+        return null;
+    }
+
+    const normalizedValue = Number(value);
+
+    if (!Number.isInteger(normalizedValue) || ![2, 3, 4].includes(normalizedValue)) {
+        throw createOrderError(
+            'INVALID_BILL_SPLIT_COUNT',
+            'La mesa solo puede dividir la cuenta entre 2, 3 o 4 personas.',
+            400
+        );
+    }
+
+    return normalizedValue;
+}
+
+function assertTableRequestPermission(actor, requestType) {
+    if (requestType === 'call_waiter') {
+        assertPermission(actor, 'requests.resolve_call_waiter');
+        return;
+    }
+
+    if (requestType === 'request_bill') {
+        assertPermission(actor, 'requests.resolve_bill');
+        return;
+    }
+
+    throw createPermissionError();
+}
+
+function assertSuborderStatusPermission(actor, nextStatus) {
+    if (nextStatus === 'processing') {
+        assertPermission(actor, 'suborders.process');
+        return;
+    }
+
+    if (nextStatus === 'ready') {
+        assertPermission(actor, 'suborders.ready');
+        return;
+    }
+
+    if (nextStatus === 'delivered') {
+        assertPermission(actor, 'suborders.deliver');
+        return;
+    }
+
+    if (nextStatus === 'cancelled') {
+        assertPermission(actor, 'suborders.cancel');
+        return;
+    }
+
+    throw createPermissionError();
 }
 
 function getFrontendHost() {
@@ -267,7 +357,7 @@ app.get('/api/venue-settings', async (req, res) => {
     }
 });
 
-app.put('/api/admin/venue-settings', requireAdmin, async (req, res) => {
+app.put('/api/admin/venue-settings', requireOwner, async (req, res) => {
     try {
         const settings = await saveVenueSettings(database, req.body);
         io.emit('venue_settings_updated');
@@ -301,6 +391,7 @@ app.get('/api/guest-links', async (req, res) => {
 app.get('/api/payments/mercado-pago/status', async (req, res) => {
     res.json({
         enabled: isMercadoPagoConfigured(),
+        mock_mode: isMercadoPagoMockMode(),
         backend_url: getBackendHost(),
     });
 });
@@ -317,12 +408,12 @@ app.get('/api/admin/cash-register/current', requireAdmin, async (req, res) => {
     }
 });
 
-app.post('/api/admin/cash-register/open', requireAdmin, async (req, res) => {
+app.post('/api/admin/cash-register/open', requirePermission('cash.open'), async (req, res) => {
     try {
         const session = await database.withTransaction(async () => openRegister(database, {
             opening_float: req.body?.opening_float,
             notes_open: req.body?.notes_open,
-            opened_by: req.admin?.role || null,
+            opened_by: formatAuditActor(req.admin),
         }));
         emitCashRegisterUpdated(session);
         res.status(201).json(session);
@@ -334,15 +425,33 @@ app.post('/api/admin/cash-register/open', requireAdmin, async (req, res) => {
     }
 });
 
-app.post('/api/admin/cash-register/current/close', requireAdmin, async (req, res) => {
+app.post('/api/admin/cash-register/current/close', requirePermission('cash.close'), async (req, res) => {
     try {
         const session = await database.withTransaction(async () => closeRegister(database, {
             counted_cash_amount: req.body?.counted_cash_amount,
             notes_close: req.body?.notes_close,
-            closed_by: req.admin?.role || null,
+            closed_by: formatAuditActor(req.admin),
         }));
         emitCashRegisterUpdated(session);
         res.json(session);
+    } catch (error) {
+        res.status(error.status || 500).json({
+            error: error.message,
+            code: error.code || 'UNKNOWN'
+        });
+    }
+});
+
+app.post('/api/admin/cash-register/current/movements', requirePermission('cash.open'), async (req, res) => {
+    try {
+        const session = await database.withTransaction(async () => createCurrentRegisterMovement(database, {
+            type: req.body?.type,
+            amount: req.body?.amount,
+            reason: req.body?.reason,
+            created_by: formatAuditActor(req.admin),
+        }));
+        emitCashRegisterUpdated(session);
+        res.status(201).json(session);
     } catch (error) {
         res.status(error.status || 500).json({
             error: error.message,
@@ -393,7 +502,7 @@ app.get('/api/admin/tables', requireAdmin, async (req, res) => {
     }
 });
 
-app.post('/api/admin/tables', requireAdmin, async (req, res) => {
+app.post('/api/admin/tables', requireOwner, async (req, res) => {
     try {
         const table = await createTable(database, req.body);
         const payload = await buildTableQrPayload(table);
@@ -403,7 +512,7 @@ app.post('/api/admin/tables', requireAdmin, async (req, res) => {
     }
 });
 
-app.delete('/api/admin/tables/:id', requireAdmin, async (req, res) => {
+app.delete('/api/admin/tables/:id', requireOwner, async (req, res) => {
     try {
         const result = await deleteTable(database, req.params.id);
         res.json({ success: true, deleted_table: result });
@@ -435,6 +544,68 @@ app.post('/api/admin/login', (req, res) => {
     }
 });
 
+app.get('/api/admin/session/current', requireAdmin, async (req, res) => {
+    try {
+        const session = await getCurrentAdminSession(database, req.adminToken);
+        res.json(session);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.delete('/api/admin/session/current', requireAdmin, async (req, res) => {
+    try {
+        if (req.admin?.auth_type === 'staff') {
+            await deleteStaffSessionByToken(database, req.adminToken);
+        }
+
+        res.status(204).send();
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.get('/api/admin/staff', requireOwner, async (req, res) => {
+    try {
+        const staffUsers = await listStaffUsers(database);
+        res.json(staffUsers);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.post('/api/admin/staff', requireOwner, async (req, res) => {
+    try {
+        const staffUser = await createStaffUser(database, req.body);
+        res.status(201).json(staffUser);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.post('/api/admin/staff/sessions', async (req, res) => {
+    try {
+        const session = await createStaffSession(database, req.body);
+        res.status(201).json(session);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.post('/api/admin/demo/reset-operational-state', requireOwner, async (req, res) => {
+    try {
+        const result = await resetOperationalDemoState(database);
+        emitOperationalStateReset(result);
+        emitCashRegisterUpdated();
+        res.json({
+            success: true,
+            ...result,
+        });
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
 // 1. Get Menu
 app.get('/api/menu', async (req, res) => {
     try {
@@ -455,7 +626,7 @@ app.get('/api/menu/active', requireAdmin, async (req, res) => {
 });
 
 // OCR + NLP Upload
-app.post('/api/menu/upload', requireAdmin, upload.single('menuImage'), async (req, res) => {
+app.post('/api/menu/upload', requirePermission('menu.manage'), upload.single('menuImage'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No image provided' });
     
     try {
@@ -504,7 +675,7 @@ app.post('/api/menu/upload', requireAdmin, upload.single('menuImage'), async (re
 });
 
 // Publish Menu
-app.post('/api/menu/publish', requireAdmin, async (req, res) => {
+app.post('/api/menu/publish', requirePermission('menu.manage'), async (req, res) => {
     const { categories, name } = req.body;
 
     if (!Array.isArray(categories)) {
@@ -524,7 +695,7 @@ app.post('/api/menu/publish', requireAdmin, async (req, res) => {
     }
 });
 
-app.delete('/api/menu/active', requireAdmin, async (req, res) => {
+app.delete('/api/menu/active', requirePermission('menu.manage'), async (req, res) => {
     try {
         const clearedMenu = await clearActiveMenu(database);
 
@@ -543,7 +714,7 @@ app.delete('/api/menu/active', requireAdmin, async (req, res) => {
     }
 });
 
-app.patch('/api/admin/menu-items/:id/availability', requireAdmin, async (req, res) => {
+app.patch('/api/admin/menu-items/:id/availability', requirePermission('menu.manage'), async (req, res) => {
     try {
         const item = await updateActiveMenuItemAvailability(
             database,
@@ -600,9 +771,19 @@ app.post('/api/tables/:id/mercado-pago/checkout', async (req, res) => {
             req.params.id,
             {
                 restaurant_name: settings.restaurant_name,
+                mock_result: req.body?.mock_result,
             }
         );
-        res.status(201).json(checkout);
+        const order = checkout?.order_id ? await getOrderById(database, checkout.order_id) : null;
+
+        if (order) {
+            emitOrderUpdated(order);
+        }
+
+        res.status(201).json({
+            ...checkout,
+            order,
+        });
     } catch (error) {
         sendOrderHttpError(res, error);
     }
@@ -618,8 +799,11 @@ app.post('/api/payments/mercado-pago/webhook', async (req, res) => {
             eventSource: 'webhook',
         });
 
-        if (result?.applied && result?.order) {
+        if (result?.order) {
             emitOrderUpdated(result.order);
+        }
+
+        if (result?.applied && result?.order) {
             emitCashRegisterUpdated();
         }
 
@@ -656,8 +840,11 @@ app.get('/api/payments/mercado-pago/return', async (req, res) => {
                             ? 'pending'
                             : 'failure';
 
-        if (result?.applied && order) {
+        if (order) {
             emitOrderUpdated(order);
+        }
+
+        if (result?.applied && order) {
             if (result?.checkout?.status === 'approved') {
                 emitCashRegisterUpdated();
             }
@@ -706,9 +893,25 @@ app.post('/api/tables/:id/request-bill', async (req, res) => {
             req.body?.preferred_payment_method,
             { allowNull: false }
         );
+        const splitCount = normalizeTableBillSplitCount(req.body?.split_count);
 
         const { tableRequest, resolvedRequests, order } = await database.withTransaction(async () => {
             const nextOrder = await markBillRequestedForTable(database, req.params.id, preferredPaymentMethod);
+            const targetOrderId = nextOrder.id;
+
+            if (splitCount == null) {
+                await clearBillSplitsForOrder(database, targetOrderId, {
+                    order: nextOrder,
+                    payments: nextOrder.payments,
+                });
+            } else {
+                await replaceEqualBillSplitsForOrder(database, targetOrderId, { count: splitCount }, {
+                    order: nextOrder,
+                    payments: nextOrder.payments,
+                });
+            }
+
+            const refreshedOrder = await getOrderById(database, targetOrderId);
 
             if (preferredPaymentMethod === 'mercado_pago') {
                 const nextResolvedRequests = await resolvePendingTableRequestsForTableByType(
@@ -720,7 +923,7 @@ app.post('/api/tables/:id/request-bill', async (req, res) => {
                 return {
                     tableRequest: null,
                     resolvedRequests: nextResolvedRequests,
-                    order: nextOrder,
+                    order: refreshedOrder,
                 };
             }
 
@@ -732,7 +935,7 @@ app.post('/api/tables/:id/request-bill', async (req, res) => {
             return {
                 tableRequest: nextTableRequest,
                 resolvedRequests: [],
-                order: nextOrder,
+                order: refreshedOrder,
             };
         });
 
@@ -747,6 +950,7 @@ app.post('/api/tables/:id/request-bill', async (req, res) => {
                 resolved_requests: resolvedRequests,
                 order,
                 preferred_payment_method: order.bill_payment_method_preference,
+                split_count: order?.bill_splits_summary?.has_split_bill ? order.bill_splits_summary.groups.length : null,
                 should_start_online_checkout: order.bill_payment_method_preference === 'mercado_pago',
             });
         }
@@ -761,6 +965,7 @@ app.post('/api/tables/:id/request-bill', async (req, res) => {
             resolved_requests: resolvedRequests,
             order,
             preferred_payment_method: order.bill_payment_method_preference,
+            split_count: order?.bill_splits_summary?.has_split_bill ? order.bill_splits_summary.groups.length : null,
             should_start_online_checkout: order.bill_payment_method_preference === 'mercado_pago',
         });
     } catch (error) {
@@ -810,6 +1015,13 @@ app.delete('/api/tables/:id/request-bill', async (req, res) => {
                 if (error.code !== 'TABLE_REQUEST_NOT_FOUND') {
                     throw error;
                 }
+            }
+
+            if (currentOrder.bill_splits_summary?.has_split_bill) {
+                await clearBillSplitsForOrder(database, currentOrder.id, {
+                    order: currentOrder,
+                    payments: currentOrder.payments,
+                });
             }
 
             const nextOrder = await clearBillRequestedForTable(database, req.params.id);
@@ -929,8 +1141,12 @@ app.get('/api/admin/suborders/open', requireAdmin, async (req, res) => {
 
 app.post('/api/admin/suborders/:id/status', requireAdmin, async (req, res) => {
     try {
+        assertSuborderStatusPermission(req.admin, req.body?.status);
         const { suborder, order } = await database.withTransaction(async () => {
-            const nextSuborder = await updateSuborderStatus(database, req.params.id, req.body?.status);
+            const nextSuborder = await updateSuborderStatus(database, req.params.id, req.body?.status, {
+                reason: req.body?.reason,
+                cancelled_by: req.body?.status === 'cancelled' ? formatAuditActor(req.admin) : null,
+            });
             const nextOrder = await getOrderById(database, nextSuborder.order_id);
             return { suborder: nextSuborder, order: nextOrder };
         });
@@ -952,7 +1168,50 @@ app.get('/api/admin/orders/:id/payments', requireAdmin, async (req, res) => {
     }
 });
 
-app.post('/api/admin/orders/:id/payments', requireAdmin, async (req, res) => {
+app.get('/api/admin/orders/:id/bill-splits', requireAdmin, async (req, res) => {
+    try {
+        const order = await getOrderById(database, req.params.id);
+        const billSplitState = await getOrderBillSplitState(database, req.params.id, {
+            order,
+            payments: order?.payments || [],
+            allowClosedRead: true,
+        });
+        res.json(billSplitState);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.post('/api/admin/orders/:id/bill-splits/equal', requirePermission('bill_splits.manage'), async (req, res) => {
+    try {
+        const billSplitState = await database.withTransaction(async () => replaceEqualBillSplitsForOrder(
+            database,
+            req.params.id,
+            { count: req.body?.count }
+        ));
+        const order = await getOrderById(database, req.params.id);
+        emitOrderUpdated(order);
+        res.status(201).json(billSplitState);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.delete('/api/admin/orders/:id/bill-splits', requirePermission('bill_splits.manage'), async (req, res) => {
+    try {
+        const billSplitState = await database.withTransaction(async () => clearBillSplitsForOrder(
+            database,
+            req.params.id
+        ));
+        const order = await getOrderById(database, req.params.id);
+        emitOrderUpdated(order);
+        res.json(billSplitState);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.post('/api/admin/orders/:id/payments', requirePermission('payments.create'), async (req, res) => {
     try {
         const order = await database.withTransaction(async () => createOrderPayment(
             database,
@@ -963,7 +1222,7 @@ app.post('/api/admin/orders/:id/payments', requireAdmin, async (req, res) => {
                 note: req.body?.note,
             },
             {
-                created_by: req.admin?.role || null,
+                created_by: formatAuditActor(req.admin),
             }
         ));
 
@@ -975,7 +1234,23 @@ app.post('/api/admin/orders/:id/payments', requireAdmin, async (req, res) => {
     }
 });
 
-app.post('/api/admin/orders/:orderId/payments/:paymentId/reversals', requireAdmin, async (req, res) => {
+app.post('/api/admin/orders/:id/payments/:paymentId/split-allocation', requirePermission('bill_splits.manage'), async (req, res) => {
+    try {
+        const billSplitState = await database.withTransaction(async () => assignPaymentToBillSplit(
+            database,
+            req.params.id,
+            req.params.paymentId,
+            { split_id: req.body?.split_id ?? null }
+        ));
+        const order = await getOrderById(database, req.params.id);
+        emitOrderUpdated(order);
+        res.json(billSplitState);
+    } catch (error) {
+        sendOrderHttpError(res, error);
+    }
+});
+
+app.post('/api/admin/orders/:orderId/payments/:paymentId/reversals', requirePermission('payments.reverse'), async (req, res) => {
     try {
         const order = await database.withTransaction(async () => reverseOrderPayment(
             database,
@@ -986,7 +1261,7 @@ app.post('/api/admin/orders/:orderId/payments/:paymentId/reversals', requireAdmi
                 reason: req.body?.reason,
             },
             {
-                created_by: req.admin?.role || null,
+                created_by: formatAuditActor(req.admin),
             }
         ));
 
@@ -998,10 +1273,12 @@ app.post('/api/admin/orders/:orderId/payments/:paymentId/reversals', requireAdmi
     }
 });
 
-app.post('/api/admin/orders/:id/close', requireAdmin, async (req, res) => {
+app.post('/api/admin/orders/:id/close', requirePermission('orders.close'), async (req, res) => {
     try {
         const { order, resolvedRequests } = await database.withTransaction(async () => {
-            const nextOrder = await closeOrderById(database, req.params.id);
+            const nextOrder = await closeOrderById(database, req.params.id, {
+                closed_by: formatAuditActor(req.admin),
+            });
             const nextResolvedRequests = await resolvePendingTableRequestsForTable(database, nextOrder.table_id);
             return { order: nextOrder, resolvedRequests: nextResolvedRequests };
         });
@@ -1036,6 +1313,14 @@ app.get('/api/table-requests', requireAdmin, async (req, res) => {
 app.post('/api/table-requests/:id/resolve', requireAdmin, async (req, res) => {
     try {
         const { tableRequest, order } = await database.withTransaction(async () => {
+            const currentTableRequest = await getTableRequestById(database, req.params.id);
+            if (!currentTableRequest) {
+                const error = new Error('Table request not found');
+                error.status = 404;
+                error.code = 'TABLE_REQUEST_NOT_FOUND';
+                throw error;
+            }
+            assertTableRequestPermission(req.admin, currentTableRequest?.type);
             const nextTableRequest = await resolveTableRequest(database, req.params.id);
             const nextOrder = nextTableRequest.type === 'request_bill'
                 ? await markBillAttendedForTable(database, nextTableRequest.table_id)
@@ -1055,10 +1340,12 @@ app.post('/api/table-requests/:id/resolve', requireAdmin, async (req, res) => {
     }
 });
 
-app.post('/api/tables/:id/close', requireAdmin, async (req, res) => {
+app.post('/api/tables/:id/close', requirePermission('orders.close'), async (req, res) => {
     try {
         const { order, resolvedRequests } = await database.withTransaction(async () => {
-            const nextOrder = await closeOpenOrderForTable(database, req.params.id);
+            const nextOrder = await closeOpenOrderForTable(database, req.params.id, {
+                closed_by: formatAuditActor(req.admin),
+            });
             const nextResolvedRequests = await resolvePendingTableRequestsForTable(database, req.params.id);
             return { order: nextOrder, resolvedRequests: nextResolvedRequests };
         });
@@ -1071,7 +1358,7 @@ app.post('/api/tables/:id/close', requireAdmin, async (req, res) => {
     }
 });
 
-app.post('/api/tables/:id/payment', requireAdmin, async (req, res) => {
+app.post('/api/tables/:id/payment', requirePermission('payments.create'), async (req, res) => {
     try {
         const order = await database.withTransaction(async () => {
             const nextOrder = await markPaymentReceivedForTable(
@@ -1080,7 +1367,7 @@ app.post('/api/tables/:id/payment', requireAdmin, async (req, res) => {
                 req.body?.payment_method,
                 {
                     note: req.body?.note,
-                    created_by: req.admin?.role || null,
+                    created_by: formatAuditActor(req.admin),
                 }
             );
             return nextOrder;
@@ -1100,9 +1387,9 @@ io.on('connection', (socket) => {
     socket.data.isAdmin = false;
     socket.data.tableRoom = null;
     
-    socket.on('join_admin', (data = {}) => {
+    socket.on('join_admin', async (data = {}) => {
         try {
-            verifySocketAdmin(socket, data.token);
+            await verifySocketAdmin(socket, data.token);
         } catch (error) {
             socket.data.isAdmin = false;
             return sendSocketAuthError(socket, error);
@@ -1147,14 +1434,23 @@ io.on('connection', (socket) => {
 
     socket.on('update_order_status', async (data = {}) => {
         try {
-            verifySocketAdmin(socket, data.token);
+            const actor = await verifySocketAdmin(socket, data.token);
+            if (!hasPermission(actor, 'suborders.process') && !hasPermission(actor, 'suborders.ready') && !hasPermission(actor, 'suborders.deliver') && !hasPermission(actor, 'suborders.cancel')) {
+                throw createPermissionError();
+            }
         } catch (error) {
+            if (error?.status === 403) {
+                return sendSocketOrderError(socket, error);
+            }
             socket.data.isAdmin = false;
             return sendSocketAuthError(socket, error);
         }
 
         try {
-            const result = await updateOrderStatus(database, data.order_id, data.status);
+            const result = await updateOrderStatus(database, data.order_id, data.status, {
+                reason: data.reason,
+                cancelled_by: data.status === 'cancelled' ? formatAuditActor(socket.data.admin) : null,
+            });
             if (result?.suborder) {
                 emitSuborderUpdated(result.suborder, result.order || null);
             }

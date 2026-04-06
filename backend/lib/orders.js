@@ -18,6 +18,15 @@ const {
   summarizeSuborders,
   updateSuborderStatus,
 } = require('./order-suborders');
+const {
+  getOrderBillSplitState,
+  hasSplitAllocationsForPayment,
+  listBillSplitStatesForOrderIds,
+} = require('./order-bill-splits');
+const {
+  listOrderChargeAdjustmentsForOrderIds,
+  sumOrderChargeAdjustments,
+} = require('./order-charge-adjustments');
 
 const ACTIVE_ORDER_STATUSES = ['pending', 'processing', 'ready', 'delivered'];
 const VALID_ORDER_STATUSES = new Set(ACTIVE_ORDER_STATUSES);
@@ -437,6 +446,10 @@ function mapOrderRows(rows) {
         payment_received_at: row.payment_received_at,
         payment_method: row.payment_method,
         closed_at: row.closed_at,
+        closed_by: row.closed_by || null,
+        items_total_amount: 0,
+        charge_adjustments_total: 0,
+        charge_adjustments: [],
         total_amount: 0,
         items: []
       });
@@ -458,6 +471,10 @@ function mapOrderRows(rows) {
 
   return Array.from(orderMap.values()).map((order) => ({
     ...order,
+    items_total_amount: roundMoney(order.items.reduce(
+      (sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 0)),
+      0
+    )),
     total_amount: roundMoney(order.items.reduce(
       (sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 0)),
       0
@@ -465,7 +482,14 @@ function mapOrderRows(rows) {
   }));
 }
 
-function decorateOrderWithPayments(order, payments = [], externalPaymentAttempts = [], suborders = []) {
+function decorateOrderWithPayments(
+  order,
+  payments = [],
+  externalPaymentAttempts = [],
+  suborders = [],
+  billSplitsSummary = null,
+  chargeAdjustments = []
+) {
   const paymentSummary = summarizeOrderPayments(order, payments);
   const attemptsSummary = summarizeExternalPaymentAttempts(externalPaymentAttempts);
   const subordersSummary = summarizeSuborders(suborders);
@@ -482,6 +506,10 @@ function decorateOrderWithPayments(order, payments = [], externalPaymentAttempts
     external_payment_attempts_summary: attemptsSummary,
     suborders,
     suborders_summary: subordersSummary,
+    bill_splits_summary: billSplitsSummary,
+    charge_adjustments: chargeAdjustments,
+    charge_adjustments_total: roundMoney(order?.charge_adjustments_total || 0),
+    items_total_amount: roundMoney(order?.items_total_amount || 0),
   };
 
   return {
@@ -498,18 +526,36 @@ function decorateOrderWithPayments(order, payments = [], externalPaymentAttempts
 
 async function enrichOrdersWithPayments(database, orders = []) {
   const orderIds = orders.map((order) => order.id);
-  const [paymentsByOrderId, externalAttemptsByOrderId, subordersByOrderId] = await Promise.all([
+  const [paymentsByOrderId, externalAttemptsByOrderId, subordersByOrderId, chargeAdjustmentsByOrderId] = await Promise.all([
     listPaymentsForOrderIds(database, orderIds),
     listExternalPaymentAttemptsForOrderIds(database, orderIds),
     listSubordersForOrderIds(database, orderIds),
+    listOrderChargeAdjustmentsForOrderIds(database, orderIds),
   ]);
+  const adjustedOrders = orders.map((order) => {
+    const chargeAdjustments = chargeAdjustmentsByOrderId.get(order.id) || [];
+    const chargeAdjustmentsTotal = sumOrderChargeAdjustments(chargeAdjustments);
 
-  return orders.map((order) => decorateOrderWithPayments(
-    order,
-    paymentsByOrderId.get(order.id) || [],
-    externalAttemptsByOrderId.get(order.id) || [],
-    subordersByOrderId.get(order.id) || []
-  ));
+    return {
+      ...order,
+      charge_adjustments: chargeAdjustments,
+      charge_adjustments_total: chargeAdjustmentsTotal,
+      total_amount: roundMoney(Number(order.items_total_amount || order.total_amount || 0) + chargeAdjustmentsTotal),
+    };
+  });
+  const billSplitsByOrderId = await listBillSplitStatesForOrderIds(database, adjustedOrders, paymentsByOrderId);
+
+  return adjustedOrders.map((adjustedOrder) => {
+    const chargeAdjustments = chargeAdjustmentsByOrderId.get(adjustedOrder.id) || [];
+    return decorateOrderWithPayments(
+      adjustedOrder,
+      paymentsByOrderId.get(adjustedOrder.id) || [],
+      externalAttemptsByOrderId.get(adjustedOrder.id) || [],
+      subordersByOrderId.get(adjustedOrder.id) || [],
+      billSplitsByOrderId.get(adjustedOrder.id) || null,
+      chargeAdjustments
+    );
+  });
 }
 
 async function getOrderRows(database, whereClause = '', params = [], orderByClause = 'ORDER BY o.created_at DESC, o.id DESC, oi.id ASC') {
@@ -530,6 +576,7 @@ async function getOrderRows(database, whereClause = '', params = [], orderByClau
         o.payment_received_at,
         o.payment_method,
         o.closed_at,
+        o.closed_by,
         oi.item_id,
         oi.quantity,
         oi.comments,
@@ -559,11 +606,26 @@ async function getOrderById(database, orderId) {
     listExternalPaymentAttemptsForOrderIds(database, [normalizedOrderId]),
     listSubordersForOrderIds(database, [normalizedOrderId]),
   ]);
+  const chargeAdjustments = (await listOrderChargeAdjustmentsForOrderIds(database, [normalizedOrderId])).get(normalizedOrderId) || [];
+  const chargeAdjustmentsTotal = sumOrderChargeAdjustments(chargeAdjustments);
+  const adjustedOrder = {
+    ...mappedOrder,
+    charge_adjustments: chargeAdjustments,
+    charge_adjustments_total: chargeAdjustmentsTotal,
+    total_amount: roundMoney(Number(mappedOrder.items_total_amount || mappedOrder.total_amount || 0) + chargeAdjustmentsTotal),
+  };
+
   return decorateOrderWithPayments(
-    mappedOrder,
+    adjustedOrder,
     payments,
     externalAttemptsByOrderId.get(normalizedOrderId) || [],
-    subordersByOrderId.get(normalizedOrderId) || []
+    subordersByOrderId.get(normalizedOrderId) || [],
+    await getOrderBillSplitState(database, normalizedOrderId, {
+      order: adjustedOrder,
+      payments,
+      allowClosedRead: true,
+    }),
+    chargeAdjustments
   );
 }
 
@@ -585,7 +647,8 @@ async function getOrderRecordById(database, orderId) {
         bill_collection_status,
         payment_received_at,
         payment_method,
-        closed_at
+        closed_at,
+        closed_by
       FROM orders
       WHERE id = ?
     `,
@@ -781,7 +844,7 @@ async function createOrder(database, payload) {
   }
 }
 
-async function updateOrderStatus(database, orderId, status) {
+async function updateOrderStatus(database, orderId, status, options = {}) {
   const normalizedOrderId = ensurePositiveInteger(orderId, 'order_id');
   if (!VALID_ORDER_STATUSES.has(status)) {
     throw createOrderError('INVALID_ORDER_STATUS', 'status is invalid');
@@ -810,7 +873,7 @@ async function updateOrderStatus(database, orderId, status) {
     throw createOrderError('SUBORDER_NOT_FOUND', 'No encontramos un subpedido operativo para actualizar.', 404);
   }
 
-  const updatedSuborder = await updateSuborderStatus(database, nextSuborder.id, status);
+  const updatedSuborder = await updateSuborderStatus(database, nextSuborder.id, status, options);
   const nextOrder = await getOrderById(database, normalizedOrderId);
 
   return {
@@ -1057,6 +1120,9 @@ async function getOrderPaymentSummary(database, orderId) {
 
   return {
     order_id: order.id,
+    items_total_amount: order.items_total_amount,
+    charge_adjustments_total: order.charge_adjustments_total,
+    charge_adjustments: order.charge_adjustments,
     total_amount: order.total_amount,
     amount_paid: order.amount_paid,
     amount_due: order.amount_due,
@@ -1067,6 +1133,7 @@ async function getOrderPaymentSummary(database, orderId) {
     payments: order.payments,
     external_payment_attempts: order.external_payment_attempts,
     external_payment_attempts_summary: order.external_payment_attempts_summary,
+    bill_splits_summary: order.bill_splits_summary,
   };
 }
 
@@ -1087,6 +1154,14 @@ async function reverseOrderPayment(database, orderId, paymentId, payload = {}, o
 
   if (!payment) {
     throw createOrderError('ORDER_PAYMENT_NOT_FOUND', 'No encontramos ese pago dentro del pedido.', 404);
+  }
+
+  if (await hasSplitAllocationsForPayment(database, normalizedPaymentId)) {
+    throw createOrderError(
+      'PAYMENT_REVERSAL_BLOCKED_BY_SPLIT_ALLOCATION',
+      'No podés revertir un pago que ya está asignado a una persona de la cuenta.',
+      409
+    );
   }
 
   const { amount } = validatePaymentReversalAgainstPayment(payment, payload?.amount);
@@ -1157,33 +1232,36 @@ async function validateOrderClose(order) {
   }
 }
 
-async function closeOrderById(database, orderId) {
+async function closeOrderById(database, orderId, options = {}) {
   const normalizedOrderId = ensurePositiveInteger(orderId, 'order_id');
   const order = await getOrderById(database, normalizedOrderId);
+  const closedBy = options?.closed_by == null ? null : String(options.closed_by).trim() || null;
 
   await validateOrderClose(order);
 
   await database.run(
     `
       UPDATE orders
-      SET closed_at = COALESCE(closed_at, CURRENT_TIMESTAMP)
+      SET
+        closed_at = COALESCE(closed_at, CURRENT_TIMESTAMP),
+        closed_by = COALESCE(closed_by, ?)
       WHERE id = ?
         AND closed_at IS NULL
     `,
-    [normalizedOrderId]
+    [closedBy, normalizedOrderId]
   );
 
   return getOrderById(database, normalizedOrderId);
 }
 
-async function closeOpenOrderForTable(database, tableId) {
+async function closeOpenOrderForTable(database, tableId, options = {}) {
   const activeOrder = await getActiveOrderForTable(database, tableId);
 
   if (!activeOrder) {
     throw createOrderError('NO_OPEN_ORDER', 'No hay un pedido abierto para cerrar esta mesa.', 404);
   }
 
-  return closeOrderById(database, activeOrder.id);
+  return closeOrderById(database, activeOrder.id, options);
 }
 
 module.exports = {

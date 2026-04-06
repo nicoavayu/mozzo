@@ -1,6 +1,8 @@
-const { extractBearerToken, verifyAdminToken } = require('../lib/auth');
+const database = require('../database');
+const { extractBearerToken } = require('../lib/auth');
+const { assertPermission, resolveAdminActor } = require('../lib/staff');
 
-function requireAdmin(req, res, next) {
+async function requireAdmin(req, res, next) {
   const token = extractBearerToken(req.headers.authorization);
 
   if (!token) {
@@ -8,7 +10,8 @@ function requireAdmin(req, res, next) {
   }
 
   try {
-    req.admin = verifyAdminToken(token);
+    req.admin = await resolveAdminActor(database, token);
+    req.adminToken = token;
     return next();
   } catch (error) {
     if (error.code === 'ADMIN_AUTH_NOT_CONFIGURED') {
@@ -23,6 +26,29 @@ function requireAdmin(req, res, next) {
   }
 }
 
+function requireOwner(req, res, next) {
+  return requireAdmin(req, res, () => {
+    if (req.admin?.role !== 'owner') {
+      return res.status(403).json({ error: 'No tenés permiso para hacer eso.' });
+    }
+
+    return next();
+  });
+}
+
+function requirePermission(permission) {
+  return (req, res, next) => requireAdmin(req, res, () => {
+    try {
+      assertPermission(req.admin, permission);
+      return next();
+    } catch (error) {
+      return res.status(error.status || 403).json({ error: error.message });
+    }
+  });
+}
+
 module.exports = {
-  requireAdmin
+  requireAdmin,
+  requireOwner,
+  requirePermission,
 };

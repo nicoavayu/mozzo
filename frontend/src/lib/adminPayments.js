@@ -2,6 +2,7 @@ const MONEY_EPSILON = 0.009;
 const MAX_PAYMENT_NOTE_LENGTH = 250;
 const MAX_PAYMENT_REVERSAL_REASON_LENGTH = 500;
 const MAX_CASH_REGISTER_NOTE_LENGTH = 500;
+const VALID_CASH_MOVEMENT_TYPES = new Set(['cash_in', 'cash_out']);
 
 function roundMoney(value) {
   return Number(Number(value || 0).toFixed(2));
@@ -197,5 +198,42 @@ export function buildCashRegisterClosePayload(form) {
   return {
     counted_cash_amount: parseMoney(form?.counted_cash_amount) ?? 0,
     notes_close: String(form?.notes_close || '').trim(),
+  };
+}
+
+export function validateCashMovementForm(form) {
+  const type = String(form?.type || '').trim().toLowerCase();
+
+  if (!VALID_CASH_MOVEMENT_TYPES.has(type)) {
+    return 'Elegí un tipo de movimiento válido.';
+  }
+
+  const rawAmount = String(form?.amount ?? '').trim();
+  if (!rawAmount) {
+    return 'Indicá un monto para el movimiento.';
+  }
+
+  const amount = parseMoney(form?.amount);
+  if (amount == null || amount <= MONEY_EPSILON) {
+    return 'El monto del movimiento debe ser mayor a 0.01.';
+  }
+
+  const reason = String(form?.reason || '').trim();
+  if (!reason) {
+    return 'Indicá el motivo del movimiento.';
+  }
+
+  if (reason.length > MAX_CASH_REGISTER_NOTE_LENGTH) {
+    return `El motivo debe tener ${MAX_CASH_REGISTER_NOTE_LENGTH} caracteres o menos.`;
+  }
+
+  return null;
+}
+
+export function buildCashMovementPayload(form) {
+  return {
+    type: String(form?.type || '').trim().toLowerCase(),
+    amount: parseMoney(form?.amount) ?? 0,
+    reason: String(form?.reason || '').trim(),
   };
 }

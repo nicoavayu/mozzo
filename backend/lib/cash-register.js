@@ -3,6 +3,13 @@ const {
   createOrderPaymentError,
   roundMoney,
 } = require('./order-payments');
+const {
+  createManualCashRegisterMovement,
+  listCashRegisterMovementsForSession,
+  recordClosingAdjustmentMovement,
+  recordOpeningFloatMovement,
+  summarizeCashRegisterMovements,
+} = require('./cash-register-movements');
 
 function createCashRegisterError(code, message, status = 400, extra = {}) {
   const error = new Error(message);
@@ -99,8 +106,9 @@ function mapRegisterSessionRow(row) {
   };
 }
 
-async function getRegisterSessionSummary(database, sessionId) {
+async function getRegisterSessionSummary(database, sessionId, options = {}) {
   const normalizedSessionId = ensurePositiveInteger(sessionId, 'cash_register_session_id');
+  const movementRows = await listCashRegisterMovementsForSession(database, normalizedSessionId);
   const paymentRows = await database.all(
     `
       SELECT
@@ -126,6 +134,19 @@ async function getRegisterSessionSummary(database, sessionId) {
       WHERE r.cash_register_session_id = ?
     `,
     [normalizedSessionId]
+  );
+
+  const cashMovementPaymentIds = new Set(
+    movementRows
+      .map((movement) => movement.order_payment_id)
+      .filter((value) => Number.isInteger(Number(value)) && Number(value) > 0)
+      .map(Number)
+  );
+  const cashMovementReversalIds = new Set(
+    movementRows
+      .map((movement) => movement.order_payment_reversal_id)
+      .filter((value) => Number.isInteger(Number(value)) && Number(value) > 0)
+      .map(Number)
   );
 
   const buckets = new Map();
@@ -185,6 +206,35 @@ async function getRegisterSessionSummary(database, sessionId) {
     ...paymentRows.map((row) => row.order_id),
     ...reversalRows.map((row) => row.order_id),
   ]);
+  const fallbackSaleCashAmount = roundMoney(
+    paymentRows
+      .filter((row) => row.method === 'cash' && !cashMovementPaymentIds.has(Number(row.id)))
+      .reduce((sum, row) => sum + Number(row.amount || 0), 0)
+  );
+  const fallbackRefundCashAmount = roundMoney(
+    reversalRows
+      .filter((row) => row.method === 'cash' && !cashMovementReversalIds.has(Number(row.id)))
+      .reduce((sum, row) => sum + Number(row.amount || 0), 0)
+  );
+  const movementSummaryBase = summarizeCashRegisterMovements(movementRows);
+  const openingFloatAmount = roundMoney(
+    movementSummaryBase.opening_float_amount > MONEY_EPSILON
+      ? movementSummaryBase.opening_float_amount
+      : Number(options?.opening_float_fallback || 0)
+  );
+  const cashMovementSummary = {
+    ...movementSummaryBase,
+    opening_float_amount: openingFloatAmount,
+    sale_cash_amount: roundMoney(movementSummaryBase.sale_cash_amount + fallbackSaleCashAmount),
+    refund_cash_amount: roundMoney(movementSummaryBase.refund_cash_amount + fallbackRefundCashAmount),
+  };
+  cashMovementSummary.expected_cash_amount = roundMoney(
+    cashMovementSummary.opening_float_amount
+    + cashMovementSummary.sale_cash_amount
+    - cashMovementSummary.refund_cash_amount
+    + cashMovementSummary.cash_in_amount
+    - cashMovementSummary.cash_out_amount
+  );
 
   return {
     total_payments_amount: roundMoney(totalPaymentsAmount),
@@ -197,6 +247,8 @@ async function getRegisterSessionSummary(database, sessionId) {
     other_payments_amount: roundMoney(totalsByMethod.other || 0),
     mercado_pago_payments_amount: roundMoney(totalsByMethod.mercado_pago || 0),
     payment_breakdown: breakdown,
+    movement_summary: cashMovementSummary,
+    movements: movementRows,
   };
 }
 
@@ -229,15 +281,19 @@ async function getRegisterSessionById(database, sessionId) {
   }
 
   const session = mapRegisterSessionRow(row);
-  const summary = await getRegisterSessionSummary(database, normalizedSessionId);
+  const summary = await getRegisterSessionSummary(database, normalizedSessionId, {
+    opening_float_fallback: session.opening_float,
+  });
   const liveExpectedCashAmount = session.closed_at
     ? session.expected_cash_amount
-    : roundMoney(session.opening_float + summary.cash_payments_amount);
+    : roundMoney(summary.movement_summary?.expected_cash_amount ?? session.opening_float);
 
   return {
     ...session,
     expected_cash_amount: liveExpectedCashAmount,
     summary,
+    movements: summary.movements || [],
+    movement_summary: summary.movement_summary || null,
   };
 }
 
@@ -306,6 +362,15 @@ async function openRegister(database, payload = {}) {
     throw error;
   }
 
+  if (openingFloat > MONEY_EPSILON) {
+    await recordOpeningFloatMovement(database, {
+      session_id: result.lastID,
+      amount: openingFloat,
+      reason: notesOpen || 'Fondo inicial',
+      created_by: openedBy,
+    });
+  }
+
   return getRegisterSessionById(database, result.lastID);
 }
 
@@ -340,6 +405,31 @@ async function closeRegister(database, payload = {}) {
     `,
     [expectedCashAmount, countedCashAmount, cashDifference, notesClose, closedBy, currentRegister.id]
   );
+
+  await recordClosingAdjustmentMovement(database, {
+    session_id: currentRegister.id,
+    difference: cashDifference,
+    reason: notesClose,
+    created_by: closedBy,
+  });
+
+  return getRegisterSessionById(database, currentRegister.id);
+}
+
+async function createCurrentRegisterMovement(database, payload = {}) {
+  const currentRegister = await getOpenRegister(database);
+
+  if (!currentRegister) {
+    throw createCashRegisterError('NO_OPEN_CASH_REGISTER', 'No hay una caja abierta para registrar movimientos.', 404);
+  }
+
+  await createManualCashRegisterMovement(database, {
+    session_id: currentRegister.id,
+    type: payload?.type,
+    amount: payload?.amount,
+    reason: payload?.reason,
+    created_by: payload?.created_by,
+  });
 
   return getRegisterSessionById(database, currentRegister.id);
 }
@@ -376,6 +466,7 @@ async function listRegisterSessions(database, { limit = 20 } = {}) {
 
 module.exports = {
   closeRegister,
+  createCurrentRegisterMovement,
   createCashRegisterError,
   getOpenRegister,
   getRegisterSessionById,

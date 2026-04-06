@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, Bell, Check, ChefHat, Clock, Copy, ExternalLink, Landmark, LogOut, Moon, Play, Plus, Printer, QrCode, Receipt, RotateCcw, Save, Sparkles, Sun, Trash2, Upload, Wallet, X } from 'lucide-react';
+import { ArrowDown, ArrowUp, Bell, Check, ChefHat, Clock, Copy, ExternalLink, Landmark, LogOut, Moon, Play, Plus, Printer, QrCode, Receipt, RotateCcw, Save, Sparkles, Sun, Trash2, Upload, Users, Wallet, X } from 'lucide-react';
 import { apiRequest, isAuthError } from '../lib/api';
 import { RESTAURANT_NAME } from '../lib/config';
 import {
@@ -35,19 +35,40 @@ import {
 import {
   buildCashRegisterClosePayload,
   buildCashRegisterOpenPayload,
+  buildCashMovementPayload,
   buildOrderPaymentPayload,
   buildPaymentReversalPayload,
   validateCashRegisterCloseForm,
+  validateCashMovementForm,
   validateCashRegisterOpenForm,
   validateOrderPaymentDraft,
   validatePaymentReversalDraft,
 } from '../lib/adminPayments';
+import {
+  buildBillSplitAllocationPayload,
+  buildBillSplitEqualPayload,
+  EQUAL_SPLIT_COUNTS,
+  getBillSplitGroupOptions,
+  getBillSplitPaymentAllocation,
+  getBillSplitSummary,
+} from '../lib/adminBillSplits';
+import { readCurrentAdminSession } from '../lib/adminAuth';
 import {
   createAdminSoundController,
   getAdminSoundEventForTableRequest,
   readAdminSoundPreference,
   writeAdminSoundPreference,
 } from '../lib/adminSoundAlerts';
+import {
+  buildStaffCreatePayload,
+  canResolveTableRequest,
+  canUpdateSuborderStatus,
+  getAdminActorBadge,
+  getRoleLabel,
+  hasAdminPermission,
+  STAFF_ROLE_OPTIONS,
+  validateStaffCreateForm,
+} from '../lib/adminStaff';
 import { useSocketStatus } from '../lib/useSocketStatus';
 
 const EXTERNAL_PROMPT_OPTIONS = [
@@ -356,7 +377,7 @@ function decorateSuborderWithOrder(suborder, order) {
 function decorateOrderSuborders(order) {
   return (order?.suborders || [])
     .map((suborder) => decorateSuborderWithOrder(suborder, order))
-    .filter(Boolean);
+    .filter((suborder) => Boolean(suborder) && suborder.status !== 'cancelled');
 }
 
 function formatExternalCheckoutStatusLabel(value) {
@@ -881,6 +902,9 @@ function upsertTableRequest(list, nextRequest) {
 }
 
 export default function AdminPanel({ socket, adminToken, venueSettings, onVenueSettingsSaved, onLogout, theme, onToggleTheme }) {
+  const [currentAdminSession, setCurrentAdminSession] = useState(null);
+  const [currentAdminSessionStatus, setCurrentAdminSessionStatus] = useState('loading');
+  const [currentAdminSessionError, setCurrentAdminSessionError] = useState('');
   const [orders, setOrders] = useState([]);
   const [ordersStatus, setOrdersStatus] = useState('loading');
   const [ordersError, setOrdersError] = useState('');
@@ -898,6 +922,9 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
   const [payingOrderId, setPayingOrderId] = useState(null);
   const [reversingPaymentId, setReversingPaymentId] = useState(null);
   const [closingOrderId, setClosingOrderId] = useState(null);
+  const [configuringBillSplitOrderId, setConfiguringBillSplitOrderId] = useState(null);
+  const [clearingBillSplitOrderId, setClearingBillSplitOrderId] = useState(null);
+  const [assigningBillSplitPaymentId, setAssigningBillSplitPaymentId] = useState(null);
   const [paymentDrafts, setPaymentDrafts] = useState({});
   const [reversalDrafts, setReversalDrafts] = useState({});
   const [showResolvedTableRequests, setShowResolvedTableRequests] = useState(false);
@@ -932,15 +959,32 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
   const [cashRegisterHistoryError, setCashRegisterHistoryError] = useState('');
   const [openRegisterForm, setOpenRegisterForm] = useState({ opening_float: '0.00', notes_open: '' });
   const [closeRegisterForm, setCloseRegisterForm] = useState({ counted_cash_amount: '', notes_close: '' });
+  const [cashMovementForm, setCashMovementForm] = useState({ type: 'cash_in', amount: '', reason: '' });
   const [cashRegisterFeedback, setCashRegisterFeedback] = useState('');
   const [cashRegisterFeedbackType, setCashRegisterFeedbackType] = useState('success');
   const [isOpeningRegister, setIsOpeningRegister] = useState(false);
   const [isClosingRegister, setIsClosingRegister] = useState(false);
+  const [isSubmittingCashMovement, setIsSubmittingCashMovement] = useState(false);
   const [settingsForm, setSettingsForm] = useState(() => normalizeVenueSettings(venueSettings));
   const [settingsErrors, setSettingsErrors] = useState({});
   const [settingsFeedback, setSettingsFeedback] = useState('');
   const [settingsFeedbackType, setSettingsFeedbackType] = useState('success');
   const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const [staffUsers, setStaffUsers] = useState([]);
+  const [staffUsersStatus, setStaffUsersStatus] = useState('idle');
+  const [staffUsersError, setStaffUsersError] = useState('');
+  const [staffActionSuccess, setStaffActionSuccess] = useState('');
+  const [staffActionError, setStaffActionError] = useState('');
+  const [staffCreateForm, setStaffCreateForm] = useState({
+    name: '',
+    login_code: '',
+    role: 'cashier',
+    pin: '',
+  });
+  const [isCreatingStaff, setIsCreatingStaff] = useState(false);
+  const [isResettingOperationalState, setIsResettingOperationalState] = useState(false);
+  const [operationalResetFeedback, setOperationalResetFeedback] = useState('');
+  const [operationalResetError, setOperationalResetError] = useState('');
   
   // Menu Import State
   const [file, setFile] = useState(null);
@@ -984,6 +1028,16 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
   const normalizedVenueSettings = normalizeVenueSettings(venueSettings);
   const adminRestaurantName = normalizedVenueSettings.restaurant_name || RESTAURANT_NAME;
   const adminSubtitle = normalizedVenueSettings.restaurant_subtitle || 'Pedidos, solicitudes y menú en un mismo tablero.';
+  const currentAdminActor = currentAdminSession?.actor || null;
+  const isOwnerActor = currentAdminActor?.role === 'owner';
+  const canManageMenu = hasAdminPermission(currentAdminActor, 'menu.manage');
+  const canManageCash = hasAdminPermission(currentAdminActor, 'cash.open') || hasAdminPermission(currentAdminActor, 'cash.close');
+  const canCreatePayments = hasAdminPermission(currentAdminActor, 'payments.create');
+  const canReversePayments = hasAdminPermission(currentAdminActor, 'payments.reverse');
+  const canCloseOrders = hasAdminPermission(currentAdminActor, 'orders.close');
+  const canManageBillSplits = hasAdminPermission(currentAdminActor, 'bill_splits.manage');
+  const canManageVenueSettings = isOwnerActor;
+  const canManageTables = isOwnerActor;
 
   const playAdminSound = useCallback((eventType) => {
     if (!soundEnabledRef.current) {
@@ -1001,6 +1055,44 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
     setSettingsForm(normalizeVenueSettings(venueSettings));
     setSettingsErrors({});
   }, [venueSettings]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const fetchCurrentAdminSession = async () => {
+      setCurrentAdminSessionStatus('loading');
+      setCurrentAdminSessionError('');
+
+      try {
+        const nextSession = await readCurrentAdminSession(adminToken);
+        if (!isMounted) {
+          return;
+        }
+
+        setCurrentAdminSession(nextSession);
+        setCurrentAdminSessionStatus('ready');
+      } catch (error) {
+        if (!isMounted) {
+          return;
+        }
+
+        if (isAuthError(error)) {
+          onLogout();
+          return;
+        }
+
+        setCurrentAdminSession(null);
+        setCurrentAdminSessionStatus('error');
+        setCurrentAdminSessionError(error.message);
+      }
+    };
+
+    fetchCurrentAdminSession();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [adminToken, onLogout]);
 
   useEffect(() => {
     soundEnabledRef.current = soundEnabled;
@@ -1067,6 +1159,124 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
       return [];
     }
   };
+
+  const refreshStaffUsers = useCallback(async ({ showLoader = true } = {}) => {
+    if (!isOwnerActor) {
+      setStaffUsers([]);
+      setStaffUsersStatus('idle');
+      setStaffUsersError('');
+      return [];
+    }
+
+    if (showLoader) {
+      setStaffUsersStatus('loading');
+    }
+    setStaffUsersError('');
+
+    try {
+      const data = await apiRequest('/api/admin/staff', { token: adminToken });
+      const nextStaffUsers = Array.isArray(data) ? data : [];
+      setStaffUsers(nextStaffUsers);
+      setStaffUsersStatus(nextStaffUsers.length > 0 ? 'ready' : 'empty');
+      return nextStaffUsers;
+    } catch (error) {
+      if (isAuthError(error)) {
+        onLogout();
+        return [];
+      }
+
+      setStaffUsersStatus('error');
+      setStaffUsersError(error.message);
+      return [];
+    }
+  }, [adminToken, isOwnerActor, onLogout]);
+
+  const resetOperationalDemoState = useCallback(async () => {
+    if (!isOwnerActor || isResettingOperationalState) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      'Esto va a borrar todos los pedidos, pagos, solicitudes, historial operativo y caja actual. El menú cargado se conserva. ¿Querés seguir?'
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setIsResettingOperationalState(true);
+    setOperationalResetFeedback('');
+    setOperationalResetError('');
+
+    try {
+      await apiRequest('/api/admin/demo/reset-operational-state', {
+        method: 'POST',
+        token: adminToken,
+      });
+
+      setOrders([]);
+      setOrdersStatus('empty');
+      setOrdersError('');
+      setSuborders([]);
+      setSubordersStatus('empty');
+      setSubordersError('');
+      setTableRequests([]);
+      setTableRequestsStatus('empty');
+      setTableRequestsError('');
+      setPaymentDrafts({});
+      setReversalDrafts({});
+      setHistoryOrders([]);
+      setHistoryOrdersStatus('empty');
+      setHistoryOrdersError('');
+      setHistorySummary(null);
+      setHistorySummaryStatus('empty');
+      setHistorySummaryError('');
+      setCashRegisterCurrent(null);
+      setCashRegisterCurrentStatus('empty');
+      setCashRegisterCurrentError('');
+      setCashRegisterHistory([]);
+      setCashRegisterHistoryStatus('empty');
+      setCashRegisterHistoryError('');
+      setOrdersActionError('');
+      setTableRequestsActionError('');
+      setCashRegisterFeedback('');
+      setCashRegisterFeedbackType('success');
+      setOperationalResetFeedback('Reseteamos el estado operativo de prueba sin tocar el menú.');
+    } catch (error) {
+      if (isAuthError(error)) {
+        onLogout();
+        return;
+      }
+
+      setOperationalResetError(error.message);
+    } finally {
+      setIsResettingOperationalState(false);
+    }
+  }, [adminToken, isOwnerActor, isResettingOperationalState, onLogout]);
+
+  useEffect(() => {
+    if (activeTab === 'menu_import' && !canManageMenu) {
+      setActiveTab('kanban');
+      return;
+    }
+
+    if (activeTab === 'cash_register' && !canManageCash) {
+      setActiveTab('kanban');
+      return;
+    }
+
+    if (activeTab === 'venue_settings' && !canManageVenueSettings) {
+      setActiveTab('kanban');
+    }
+  }, [activeTab, canManageCash, canManageMenu, canManageVenueSettings]);
+
+  useEffect(() => {
+    if (!isOwnerActor || activeTab !== 'venue_settings' || staffUsersStatus !== 'idle') {
+      return;
+    }
+
+    refreshStaffUsers({ showLoader: true });
+  }, [activeTab, isOwnerActor, refreshStaffUsers, staffUsersStatus]);
 
   const refreshActiveMenuInfo = async () => {
     try {
@@ -1661,6 +1871,34 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
       }
     };
 
+    const handleOperationalStateReset = () => {
+      setOrders([]);
+      setOrdersStatus('empty');
+      setOrdersError('');
+      setSuborders([]);
+      setSubordersStatus('empty');
+      setSubordersError('');
+      setTableRequests([]);
+      setTableRequestsStatus('empty');
+      setTableRequestsError('');
+      setPaymentDrafts({});
+      setReversalDrafts({});
+      setCashRegisterCurrent(null);
+      setCashRegisterCurrentStatus('empty');
+      setCashRegisterCurrentError('');
+      setCashRegisterHistory([]);
+      setCashRegisterHistoryStatus('empty');
+      setCashRegisterHistoryError('');
+      setHistoryReloadKey((current) => current + 1);
+      loadOrders({ showLoader: false });
+      loadSuborders({ showLoader: false });
+      loadTableRequests({ showLoader: false });
+      loadCashRegisterCurrent({ showLoader: false });
+      if (activeTab === 'cash_register') {
+        refreshCashRegisterHistory({ showLoader: false });
+      }
+    };
+
     joinAdminRoom();
     loadOrders();
     loadSuborders();
@@ -1679,6 +1917,7 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
     socket.on('cash_register_updated', handleCashRegisterUpdated);
     socket.on('table_request_created', handleTableRequestCreated);
     socket.on('table_request_updated', handleTableRequestUpdated);
+    socket.on('operational_state_reset', handleOperationalStateReset);
     socket.on('order_error', handleOrderError);
     socket.on('auth_error', handleAuthError);
 
@@ -1693,6 +1932,7 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
       socket.off('cash_register_updated', handleCashRegisterUpdated);
       socket.off('table_request_created', handleTableRequestCreated);
       socket.off('table_request_updated', handleTableRequestUpdated);
+      socket.off('operational_state_reset', handleOperationalStateReset);
       socket.off('order_error', handleOrderError);
       socket.off('auth_error', handleAuthError);
     };
@@ -1771,7 +2011,7 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
     };
   }, [activeTab, adminToken, historyFilters, historyReloadKey, onLogout]);
 
-  const updateSuborderLifecycle = async (suborderId, newStatus) => {
+  const updateSuborderLifecycle = async (suborderId, newStatus, extraPayload = {}) => {
     setUpdatingSuborderId(suborderId);
     setOrdersActionError('');
 
@@ -1779,13 +2019,20 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
       const response = await apiRequest(`/api/admin/suborders/${suborderId}/status`, {
         method: 'POST',
         token: adminToken,
-        body: { status: newStatus },
+        body: {
+          status: newStatus,
+          ...(extraPayload?.reason ? { reason: extraPayload.reason } : {}),
+        },
       });
 
       const nextSuborder = decorateSuborderWithOrder(response?.suborder || null, response?.order || null);
 
       if (nextSuborder) {
-        setSuborders((previous) => upsertSuborder(previous, nextSuborder));
+        setSuborders((previous) => (
+          nextSuborder.status === 'cancelled'
+            ? previous.filter((entry) => entry.id !== nextSuborder.id)
+            : upsertSuborder(previous, nextSuborder)
+        ));
         setSubordersStatus('ready');
         setSubordersError('');
       }
@@ -1807,6 +2054,25 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
     } finally {
       setUpdatingSuborderId(null);
     }
+  };
+
+  const cancelSuborder = async (suborder) => {
+    const confirmed = window.confirm(
+      `Vas a cancelar el envío #${suborder.sequence_number} de la mesa ${suborder.table_id}. El total de la cuenta va a bajar y no se borra el historial.`
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    const reason = window.prompt('Motivo de cancelación (opcional)', '');
+    if (reason === null) {
+      return;
+    }
+
+    await updateSuborderLifecycle(suborder.id, 'cancelled', {
+      reason: reason.trim(),
+    });
   };
 
   const updatePaymentDraft = (orderId, field, value) => {
@@ -1884,6 +2150,85 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
       setOrdersActionError(error.message);
     } finally {
       setPayingOrderId(null);
+    }
+  };
+
+  const patchOrderBillSplitSummary = useCallback((orderId, billSplitSummary) => {
+    setOrders((previous) => previous.map((order) => (
+      order.id === orderId
+        ? { ...order, bill_splits_summary: billSplitSummary }
+        : order
+    )));
+  }, []);
+
+  const configureEqualBillSplit = async (order, count) => {
+    setConfiguringBillSplitOrderId(order.id);
+    setOrdersActionError('');
+
+    try {
+      const summary = await apiRequest(`/api/admin/orders/${order.id}/bill-splits/equal`, {
+        method: 'POST',
+        token: adminToken,
+        body: buildBillSplitEqualPayload(count),
+      });
+
+      patchOrderBillSplitSummary(order.id, summary);
+    } catch (error) {
+      if (isAuthError(error)) {
+        onLogout();
+        return;
+      }
+
+      setOrdersActionError(error.message);
+    } finally {
+      setConfiguringBillSplitOrderId(null);
+    }
+  };
+
+  const clearBillSplitConfiguration = async (order) => {
+    setClearingBillSplitOrderId(order.id);
+    setOrdersActionError('');
+
+    try {
+      const summary = await apiRequest(`/api/admin/orders/${order.id}/bill-splits`, {
+        method: 'DELETE',
+        token: adminToken,
+      });
+
+      patchOrderBillSplitSummary(order.id, summary);
+    } catch (error) {
+      if (isAuthError(error)) {
+        onLogout();
+        return;
+      }
+
+      setOrdersActionError(error.message);
+    } finally {
+      setClearingBillSplitOrderId(null);
+    }
+  };
+
+  const assignPaymentToBillSplitGroup = async (order, payment, splitId) => {
+    setAssigningBillSplitPaymentId(payment.id);
+    setOrdersActionError('');
+
+    try {
+      const summary = await apiRequest(`/api/admin/orders/${order.id}/payments/${payment.id}/split-allocation`, {
+        method: 'POST',
+        token: adminToken,
+        body: buildBillSplitAllocationPayload(splitId),
+      });
+
+      patchOrderBillSplitSummary(order.id, summary);
+    } catch (error) {
+      if (isAuthError(error)) {
+        onLogout();
+        return;
+      }
+
+      setOrdersActionError(error.message);
+    } finally {
+      setAssigningBillSplitPaymentId(null);
     }
   };
 
@@ -1988,6 +2333,14 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
     setCashRegisterFeedback('');
   };
 
+  const updateCashMovementField = (field, value) => {
+    setCashMovementForm((current) => ({
+      ...current,
+      [field]: value,
+    }));
+    setCashRegisterFeedback('');
+  };
+
   const submitOpenRegister = async () => {
     const openRegisterError = validateCashRegisterOpenForm(openRegisterForm);
 
@@ -2065,6 +2418,63 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
       setCashRegisterFeedback(error.message);
     } finally {
       setIsClosingRegister(false);
+    }
+  };
+
+  const submitCashMovement = async () => {
+    if (!cashRegisterCurrent) {
+      setCashRegisterFeedbackType('error');
+      setCashRegisterFeedback('Abrí una caja antes de registrar movimientos.');
+      return;
+    }
+
+    const cashMovementError = validateCashMovementForm(cashMovementForm);
+
+    if (cashMovementError) {
+      setCashRegisterFeedbackType('error');
+      setCashRegisterFeedback(cashMovementError);
+      return;
+    }
+
+    const movementPayload = buildCashMovementPayload(cashMovementForm);
+    const confirmed = window.confirm(
+      `${movementPayload.type === 'cash_in' ? 'Registrar ingreso' : 'Registrar retiro'} por ${formatMenuMoney(movementPayload.amount)}.`
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setIsSubmittingCashMovement(true);
+    setCashRegisterFeedback('');
+
+    try {
+      const session = await apiRequest('/api/admin/cash-register/current/movements', {
+        method: 'POST',
+        token: adminToken,
+        body: movementPayload,
+      });
+
+      setCashRegisterCurrent(session);
+      setCashRegisterCurrentStatus('ready');
+      setCloseRegisterForm((current) => ({
+        ...current,
+        counted_cash_amount: current.counted_cash_amount || (session.expected_cash_amount != null ? Number(session.expected_cash_amount).toFixed(2) : ''),
+      }));
+      setCashMovementForm({ type: movementPayload.type, amount: '', reason: '' });
+      setCashRegisterFeedbackType('success');
+      setCashRegisterFeedback(movementPayload.type === 'cash_in' ? 'Ingreso registrado.' : 'Retiro registrado.');
+      refreshCashRegisterHistory({ showLoader: false });
+    } catch (error) {
+      if (isAuthError(error)) {
+        onLogout();
+        return;
+      }
+
+      setCashRegisterFeedbackType('error');
+      setCashRegisterFeedback(error.message);
+    } finally {
+      setIsSubmittingCashMovement(false);
     }
   };
 
@@ -2270,6 +2680,9 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
   };
 
   const openVenueSettings = () => {
+    if (!canManageVenueSettings) {
+      return;
+    }
     setActiveTab('venue_settings');
     setSettingsFeedback('');
     setSettingsFeedbackType('success');
@@ -2280,6 +2693,9 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
   };
 
   const openCashRegisterTab = () => {
+    if (!canManageCash) {
+      return;
+    }
     setActiveTab('cash_register');
     setCashRegisterFeedback('');
     setCashRegisterFeedbackType('success');
@@ -2320,6 +2736,9 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
   };
 
   const openAddTableModal = () => {
+    if (!canManageTables) {
+      return;
+    }
     const nextTableId = (tables[tables.length - 1]?.id || 0) + 1;
     setNewTableId(String(nextTableId));
     setTablesActionError('');
@@ -2593,6 +3012,54 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
       setSettingsFeedback(error.message);
     } finally {
       setIsSavingSettings(false);
+    }
+  };
+
+  const updateStaffCreateField = (field, value) => {
+    setStaffCreateForm((current) => ({
+      ...current,
+      [field]: field === 'login_code' ? String(value || '').toUpperCase() : value,
+    }));
+    setStaffActionError('');
+    setStaffActionSuccess('');
+  };
+
+  const createStaffMember = async (event) => {
+    event.preventDefault();
+    const formError = validateStaffCreateForm(staffCreateForm);
+    setStaffActionError('');
+    setStaffActionSuccess('');
+
+    if (formError) {
+      setStaffActionError(formError);
+      return;
+    }
+
+    setIsCreatingStaff(true);
+
+    try {
+      await apiRequest('/api/admin/staff', {
+        method: 'POST',
+        token: adminToken,
+        body: buildStaffCreatePayload(staffCreateForm),
+      });
+      setStaffCreateForm({
+        name: '',
+        login_code: '',
+        role: 'cashier',
+        pin: '',
+      });
+      setStaffActionSuccess('Staff creado.');
+      await refreshStaffUsers({ showLoader: false });
+    } catch (error) {
+      if (isAuthError(error)) {
+        onLogout();
+        return;
+      }
+
+      setStaffActionError(error.message);
+    } finally {
+      setIsCreatingStaff(false);
     }
   };
 
@@ -2988,6 +3455,7 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
   const historyPaymentBreakdown = Array.isArray(historySummary?.payment_breakdown) ? historySummary.payment_breakdown : [];
   const openRegisterFormError = validateCashRegisterOpenForm(openRegisterForm);
   const closeRegisterFormError = cashRegisterCurrent ? validateCashRegisterCloseForm(closeRegisterForm) : null;
+  const cashMovementFormError = cashRegisterCurrent ? validateCashMovementForm(cashMovementForm) : null;
 
   const renderReviewLineCard = (line, index, sourceLabel) => {
     const lineKey = reviewLineIdentity(line);
@@ -3159,6 +3627,11 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
     const isClosingOrder = closingOrderId === order.id;
     const hasPayments = Array.isArray(order.payments) && order.payments.length > 0;
     const needsCashRegister = paymentDraft.method === 'cash' && !cashRegisterCurrent;
+    const billSplitSummary = getBillSplitSummary(order);
+    const billSplitOptions = getBillSplitGroupOptions(billSplitSummary);
+    const isConfiguringBillSplit = configuringBillSplitOrderId === order.id;
+    const isClearingBillSplit = clearingBillSplitOrderId === order.id;
+    const canShowBillSplit = order.status === 'delivered' && order.bill_requested_at && !order.closed_at;
 
     return (
     <div className={`order-card ${order.status === 'delivered' ? 'is-delivered' : ''}`} key={order.id}>
@@ -3255,6 +3728,76 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
           <strong>{formatPaymentStatusLabel(order.payment_status)}</strong>
         </div>
       </div>
+      {renderOrderChargeAdjustments(order)}
+      {canShowBillSplit && (
+        <div className="order-bill-split-panel">
+          <div className="order-bill-split-head">
+            <div>
+              <strong>Dividir cuenta</strong>
+              <span>Separá cuánto debe cada persona sin tocar el cobro global de la mesa.</span>
+            </div>
+            {billSplitSummary.has_split_bill ? (
+              <span className="admin-badge is-info">{billSplitSummary.groups.length} persona(s)</span>
+            ) : null}
+          </div>
+          {!billSplitSummary.has_split_bill ? (
+            <div className="order-bill-split-actions">
+              {canManageBillSplits ? (
+                EQUAL_SPLIT_COUNTS.map((count) => (
+                  <button
+                    key={`equal-split-${order.id}-${count}`}
+                    className="btn admin-outline-action"
+                    type="button"
+                    onClick={() => configureEqualBillSplit(order, count)}
+                    disabled={isConfiguringBillSplit || !billSplitSummary.can_configure}
+                  >
+                    <Users size={16} /> {isConfiguringBillSplit ? 'Configurando...' : `Entre ${count}`}
+                  </button>
+                ))
+              ) : (
+                <span className="order-economic-note">Solo caja, manager u owner pueden dividir la cuenta.</span>
+              )}
+            </div>
+          ) : (
+            <>
+              <div className="order-bill-split-groups">
+                {billSplitSummary.groups.map((group) => (
+                  <div className="order-bill-split-group" key={`order-${order.id}-group-${group.id}`}>
+                    <div className="order-bill-split-group-head">
+                      <strong>{group.label}</strong>
+                      <span className={`admin-badge ${group.status === 'settled' ? 'is-success' : 'is-warning'}`}>
+                        {group.status === 'settled' ? 'Saldada' : 'Abierta'}
+                      </span>
+                    </div>
+                    <div className="order-bill-split-group-metrics">
+                      <span>Debe <strong>{formatMenuMoney(group.amount_assigned)}</strong></span>
+                      <span>Pagó <strong>{formatMenuMoney(group.amount_paid)}</strong></span>
+                      <span>Falta <strong>{formatMenuMoney(group.amount_due)}</strong></span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="order-bill-split-footer">
+                <span>
+                  Pagos sin asignar: <strong>{formatMenuMoney(billSplitSummary?.unallocated_summary?.payments_total_unallocated || 0)}</strong>
+                </span>
+                {billSplitSummary.can_clear && canManageBillSplits ? (
+                  <button
+                    className="btn admin-outline-action"
+                    type="button"
+                    onClick={() => clearBillSplitConfiguration(order)}
+                    disabled={isClearingBillSplit}
+                  >
+                    <Trash2 size={16} /> {isClearingBillSplit ? 'Limpiando...' : 'Limpiar división'}
+                  </button>
+                ) : billSplitSummary.has_assigned_payments && canManageBillSplits ? (
+                  <span className="order-economic-note">Ya hay pagos asignados. No podés reconfigurar esta división.</span>
+                ) : null}
+              </div>
+            </>
+          )}
+        </div>
+      )}
 	      <div className="order-header">
 	        <div className="table-request-card-meta-row">
 	          {order.bill_requested_at && (
@@ -3266,6 +3809,11 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
           {order.bill_payment_method_preference && (
             <span className="admin-badge is-info">
               {formatBillPaymentMethodLabel(order.bill_payment_method_preference)}
+            </span>
+          )}
+          {billSplitSummary.has_split_bill && (
+            <span className="admin-badge is-info">
+              Entre {billSplitSummary.groups.length}
             </span>
           )}
           {order.bill_collection_status && (
@@ -3284,6 +3832,11 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
 	              MP {order.external_payment_attempts_summary.total_attempts} intento(s)
 	            </span>
 	          )}
+	          {order?.external_payment_attempts_summary?.latest_status ? (
+	            <span className={`admin-badge ${getExternalCheckoutStatusBadgeClass(order.external_payment_attempts_summary.latest_status)}`}>
+	              MP {formatExternalCheckoutStatusLabel(order.external_payment_attempts_summary.latest_status)}
+	            </span>
+	          ) : null}
 	          {order?.external_payment_attempts_summary?.has_issues && (
 	            <span className="admin-badge is-danger">Revisar MP</span>
 	          )}
@@ -3292,6 +3845,7 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
       {hasPayments && (
         <div className="order-payment-list">
           {order.payments.map((payment, index) => {
+            const paymentBillSplit = getBillSplitPaymentAllocation(billSplitSummary, payment.id);
             const reversalDraft = {
               ...buildPaymentReversalDraft(payment),
               ...(payment.id ? reversalDrafts[payment.id] || {} : {}),
@@ -3317,8 +3871,34 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
                       </span>
                     ) : null}
                     {payment.fully_reversed ? <span className="admin-badge is-muted">Revertido completo</span> : null}
+                    {paymentBillSplit?.allocated_split_label ? (
+                      <span className="admin-badge is-info">Asignado a {paymentBillSplit.allocated_split_label}</span>
+                    ) : null}
                   </div>
                 </div>
+                {billSplitSummary.has_split_bill && payment.id && !payment.legacy && canManageBillSplits ? (
+                  <div className="order-payment-split-allocation">
+                    <label className="order-payment-field order-payment-field--wide">
+                      <span>Aplicar a</span>
+                      <select
+                        value={paymentBillSplit?.allocated_split_id ? String(paymentBillSplit.allocated_split_id) : ''}
+                        onChange={(event) => assignPaymentToBillSplitGroup(order, payment, event.target.value)}
+                        disabled={assigningBillSplitPaymentId === payment.id || !paymentBillSplit?.can_allocate}
+                      >
+                        {billSplitOptions.map((option) => (
+                          <option key={`payment-${payment.id}-split-${option.value || 'none'}`} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    {paymentBillSplit ? (
+                      <div className="order-economic-note">
+                        Sin asignar: {formatMenuMoney(paymentBillSplit.unallocated_amount || 0)}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
                 {Array.isArray(payment.reversals) && payment.reversals.length > 0 && (
 	                  <div className="order-payment-reversal-list">
 	                    {payment.reversals.map((reversal) => (
@@ -3333,7 +3913,12 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
 	                    ))}
 	                  </div>
 	                )}
-                {!payment.legacy && Number(payment.reversible_amount || 0) > 0 && order.status === 'delivered' && !order.closed_at && (
+                {!payment.legacy
+                  && canReversePayments
+                  && Number(payment.reversible_amount || 0) > 0
+                  && order.status === 'delivered'
+                  && !order.closed_at
+                  && !paymentBillSplit?.allocated_split_id && (
                   <div className="order-payment-reversal-form">
                     <label className="order-payment-field">
                       <span>Revertir monto</span>
@@ -3370,6 +3955,11 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
                     </button>
                   </div>
                 )}
+                {paymentBillSplit?.allocated_split_id ? (
+                  <div className="order-economic-note">
+                    Limpiá la asignación del split antes de revertir este pago.
+                  </div>
+                ) : null}
               </div>
             );
 	          })}
@@ -3394,7 +3984,7 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
                 {buildBillCollectionCopy(order)}
               </div>
             )}
-            {order.bill_attended_at && order.amount_due > 0 && (
+            {order.bill_attended_at && order.amount_due > 0 && canCreatePayments && (
               <div className="order-economic-controls">
                 <label className="order-payment-field">
                   <span>Monto</span>
@@ -3455,7 +4045,7 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
                 El pedido quedó completamente saldado. Ya podés cerrar la mesa.
               </div>
             )}
-            {order.can_close && (
+            {order.can_close && canCloseOrders && (
               <button
                 className="btn admin-outline-action is-success"
                 onClick={() => closeOrder(order)}
@@ -3471,8 +4061,53 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
     );
   };
 
+  const renderOrderChargeAdjustments = (order, { history = false } = {}) => {
+    if (!Array.isArray(order?.charge_adjustments) || order.charge_adjustments.length === 0) {
+      return null;
+    }
+
+    return (
+      <div className={`order-adjustments-panel ${history ? 'is-history' : ''}`}>
+        <div className="order-adjustments-head">
+          <div>
+            <strong>Ajustes operativos</strong>
+            <span>El total de la cuenta baja por ajuste append-only.</span>
+          </div>
+          <span>{formatMenuMoney(order.charge_adjustments_total || 0)}</span>
+        </div>
+        <div className="order-adjustments-list">
+          {order.charge_adjustments.map((adjustment) => {
+            const relatedSuborder = Array.isArray(order.suborders)
+              ? order.suborders.find((suborder) => suborder.id === adjustment.suborder_id)
+              : null;
+
+            return (
+              <div className="order-adjustment-row" key={`${history ? 'history' : 'open'}-${order.id}-adjustment-${adjustment.id}`}>
+                <div>
+                  <strong>
+                    {adjustment.type === 'suborder_cancellation'
+                      ? `Cancelación de envío${relatedSuborder?.sequence_number ? ` #${relatedSuborder.sequence_number}` : ''}`
+                      : 'Ajuste'}
+                  </strong>
+                  <span>
+                    {history ? formatOrderDateTime(adjustment.created_at) : formatOrderTime(adjustment.created_at)}
+                    {adjustment.created_by ? ` · ${formatAuditActorLabel(adjustment.created_by)}` : ''}
+                    {adjustment.reason ? ` · ${adjustment.reason}` : ''}
+                  </span>
+                </div>
+                <strong>{formatMenuMoney(adjustment.amount_delta)}</strong>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
   const renderSuborderCard = (suborder) => {
     const isUpdatingSuborder = updatingSuborderId === suborder.id;
+    const canCancelSuborder = ['pending', 'processing', 'ready'].includes(suborder.status)
+      && canUpdateSuborderStatus(currentAdminActor, 'cancelled');
 
     return (
       <div className="order-card order-card--suborder" key={`suborder-${suborder.id}`}>
@@ -3509,6 +4144,12 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
               <span>{formatOrderTime(suborder.delivered_at)}</span>
             </span>
           ) : null}
+          {suborder.cancelled_at ? (
+            <span className="order-timeline-item">
+              <strong>Cancelado</strong>
+              <span>{formatOrderTime(suborder.cancelled_at)}</span>
+            </span>
+          ) : null}
         </div>
         <ul className="order-items-list">
           {(suborder.items || []).map((item, idx) => (
@@ -3537,7 +4178,7 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
           </div>
         </div>
         <div className="order-actions">
-          {suborder.status === 'pending' ? (
+          {suborder.status === 'pending' && canUpdateSuborderStatus(currentAdminActor, 'processing') ? (
             <button
               className="btn admin-outline-action is-warning"
               onClick={() => updateSuborderLifecycle(suborder.id, 'processing')}
@@ -3546,7 +4187,7 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
               <Play size={16} /> {isUpdatingSuborder ? 'Actualizando...' : 'Preparar'}
             </button>
           ) : null}
-          {suborder.status === 'processing' ? (
+          {suborder.status === 'processing' && canUpdateSuborderStatus(currentAdminActor, 'ready') ? (
             <button
               className="btn admin-outline-action is-success"
               onClick={() => updateSuborderLifecycle(suborder.id, 'ready')}
@@ -3555,13 +4196,22 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
               <Check size={16} /> {isUpdatingSuborder ? 'Actualizando...' : 'Listo'}
             </button>
           ) : null}
-          {suborder.status === 'ready' ? (
+          {suborder.status === 'ready' && canUpdateSuborderStatus(currentAdminActor, 'delivered') ? (
             <button
               className="btn admin-outline-action is-success"
               onClick={() => updateSuborderLifecycle(suborder.id, 'delivered')}
               disabled={isUpdatingSuborder}
             >
               <Check size={16} /> {isUpdatingSuborder ? 'Actualizando...' : 'Entregado'}
+            </button>
+          ) : null}
+          {canCancelSuborder ? (
+            <button
+              className="btn admin-outline-action is-danger"
+              onClick={() => cancelSuborder(suborder)}
+              disabled={isUpdatingSuborder}
+            >
+              <Trash2 size={16} /> {isUpdatingSuborder ? 'Cancelando...' : 'Cancelar subpedido'}
             </button>
           ) : null}
         </div>
@@ -3706,9 +4356,12 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
             </div>
             <div className="history-order-financials">
               <span><strong>Total:</strong> {formatMenuMoney(order.total_amount)}</span>
+              <span><strong>Base items:</strong> {formatMenuMoney(order.items_total_amount)}</span>
+              <span><strong>Ajustes:</strong> {formatMenuMoney(order.charge_adjustments_total || 0)}</span>
               <span><strong>Pagado:</strong> {formatMenuMoney(order.amount_paid)}</span>
               <span><strong>Saldo:</strong> {formatMenuMoney(order.amount_due)}</span>
             </div>
+            {renderOrderChargeAdjustments(order, { history: true })}
             {Array.isArray(order.payments) && order.payments.length > 0 && (
               <div className="history-order-payments">
 	                {order.payments.map((payment, index) => (
@@ -3795,7 +4448,7 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
           <span>Resuelta {new Date(request.resolved_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
         )}
       </div>
-      {request.status === 'pending' && (
+      {request.status === 'pending' && canResolveTableRequest(currentAdminActor, request.type) && (
         <button
           className="btn admin-outline-action is-success"
           onClick={() => resolvePendingTableRequest(request.id)}
@@ -3846,9 +4499,29 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
           >
             <span className="admin-connection-led-dot" />
           </span>
-          <button className="btn" onClick={onLogout}><LogOut size={16} /> Salir</button>
+          <button className="btn" onClick={onLogout}><LogOut size={16} /> Cambiar usuario</button>
         </div>
       </header>
+
+      <div className="glass-panel admin-current-user-card">
+        <div>
+          <span className="admin-pill">Usuario actual</span>
+          <strong>
+            {currentAdminActor ? `${currentAdminActor.name} · ${getRoleLabel(currentAdminActor.role)}` : 'Cargando sesión...'}
+          </strong>
+          <span>
+            {currentAdminActor ? getAdminActorBadge(currentAdminActor) : currentAdminSessionError || 'Verificando sesión operativa.'}
+          </span>
+        </div>
+        <div className="admin-current-user-card-actions">
+          {currentAdminSessionStatus === 'error' ? (
+            <span className="order-economic-note is-error">{currentAdminSessionError}</span>
+          ) : null}
+          <button className="btn" type="button" onClick={onLogout}>
+            <LogOut size={16} /> Cerrar sesión
+          </button>
+        </div>
+      </div>
 
       <div className="glass-panel admin-nav-tabs">
         <button
@@ -3858,13 +4531,15 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
         >
           Tablero Realtime
         </button>
-        <button
-          className={`btn ${activeTab === 'menu_import' ? 'btn-primary' : ''}`}
-          type="button"
-          onClick={focusImportFlow}
-        >
-          Importar Menú (Foto)
-        </button>
+        {canManageMenu && (
+          <button
+            className={`btn ${activeTab === 'menu_import' ? 'btn-primary' : ''}`}
+            type="button"
+            onClick={focusImportFlow}
+          >
+            Importar Menú (Foto)
+          </button>
+        )}
         <button
           className={`btn ${activeTab === 'history' ? 'btn-primary' : ''}`}
           type="button"
@@ -3872,31 +4547,39 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
         >
           Historial
         </button>
-        <button
-          className={`btn ${activeTab === 'cash_register' ? 'btn-primary' : ''}`}
-          type="button"
-          onClick={openCashRegisterTab}
-        >
-          Caja
-        </button>
-        <button
-          className={`btn ${activeTab === 'venue_settings' ? 'btn-primary' : ''}`}
-          type="button"
-          onClick={openVenueSettings}
-        >
-          Configurar Local
-        </button>
+        {canManageCash && (
+          <button
+            className={`btn ${activeTab === 'cash_register' ? 'btn-primary' : ''}`}
+            type="button"
+            onClick={openCashRegisterTab}
+          >
+            Caja
+          </button>
+        )}
+        {canManageVenueSettings && (
+          <button
+            className={`btn ${activeTab === 'venue_settings' ? 'btn-primary' : ''}`}
+            type="button"
+            onClick={openVenueSettings}
+          >
+            Configurar Local
+          </button>
+        )}
       </div>
 
       {activeTab === 'kanban' && (
         <>
           <div className="admin-toolbar">
-            <button className="btn" type="button" onClick={openAddTableModal}>
-              <Plus size={16} /> Agregar mesa
-            </button>
-            <button className="btn" type="button" onClick={openCashRegisterTab}>
-              <Landmark size={16} /> {cashRegisterCurrent ? 'Caja abierta' : 'Abrir caja'}
-            </button>
+            {canManageTables && (
+              <button className="btn" type="button" onClick={openAddTableModal}>
+                <Plus size={16} /> Agregar mesa
+              </button>
+            )}
+            {canManageCash && (
+              <button className="btn" type="button" onClick={openCashRegisterTab}>
+                <Landmark size={16} /> {cashRegisterCurrent ? 'Caja abierta' : 'Abrir caja'}
+              </button>
+            )}
           </div>
 
           {ordersActionError && (
@@ -5097,6 +5780,10 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
 
             {cashRegisterCurrent && (
               <>
+                {(() => {
+                  const movementSummary = cashRegisterCurrent.movement_summary || {};
+
+                  return (
                 <div className="cash-register-summary-grid">
                   <div className="glass-panel history-summary-card">
                     <span className="admin-pill">Estado</span>
@@ -5105,13 +5792,43 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
                   </div>
                   <div className="glass-panel history-summary-card">
                     <span className="admin-pill">Fondo inicial</span>
-                    <strong>{formatMenuMoney(cashRegisterCurrent.opening_float)}</strong>
+                    <strong>{formatMenuMoney(movementSummary.opening_float_amount ?? cashRegisterCurrent.opening_float)}</strong>
                     <span>Caja al abrir</span>
+                  </div>
+                  <div className="glass-panel history-summary-card">
+                    <span className="admin-pill">Ventas cash</span>
+                    <strong>{formatMenuMoney(movementSummary.sale_cash_amount || 0)}</strong>
+                    <span>Pagos cash registrados</span>
+                  </div>
+                  <div className="glass-panel history-summary-card">
+                    <span className="admin-pill">Refunds cash</span>
+                    <strong>{formatMenuMoney(movementSummary.refund_cash_amount || 0)}</strong>
+                    <span>Reversals cash</span>
+                  </div>
+                  <div className="glass-panel history-summary-card">
+                    <span className="admin-pill">Ingresos manuales</span>
+                    <strong>{formatMenuMoney(movementSummary.cash_in_amount || 0)}</strong>
+                    <span>Cash in</span>
+                  </div>
+                  <div className="glass-panel history-summary-card">
+                    <span className="admin-pill">Retiros manuales</span>
+                    <strong>{formatMenuMoney(movementSummary.cash_out_amount || 0)}</strong>
+                    <span>Cash out</span>
                   </div>
                   <div className="glass-panel history-summary-card">
                     <span className="admin-pill">Esperado cash</span>
                     <strong>{formatMenuMoney(cashRegisterCurrent.expected_cash_amount)}</strong>
-                    <span>Fondo + pagos cash</span>
+                    <span>Fondo + ventas - refunds + ingresos - retiros</span>
+                  </div>
+                  <div className="glass-panel history-summary-card">
+                    <span className="admin-pill">Contado</span>
+                    <strong>{cashRegisterCurrent.counted_cash_amount == null ? '—' : formatMenuMoney(cashRegisterCurrent.counted_cash_amount)}</strong>
+                    <span>Solo al cerrar</span>
+                  </div>
+                  <div className="glass-panel history-summary-card">
+                    <span className="admin-pill">Diferencia</span>
+                    <strong>{cashRegisterCurrent.cash_difference == null ? '—' : formatMenuMoney(cashRegisterCurrent.cash_difference)}</strong>
+                    <span>Solo al cerrar</span>
                   </div>
                   <div className="glass-panel history-summary-card">
                     <span className="admin-pill">Cobrado total</span>
@@ -5119,6 +5836,8 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
                     <span>{cashRegisterCurrent.summary?.total_payments_count || 0} pago(s)</span>
                   </div>
                 </div>
+                  );
+                })()}
 
                 <div className="glass-panel history-breakdown-panel">
                   <div className="history-breakdown-head">
@@ -5138,6 +5857,112 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
                         <span>{formatMenuMoney(entry.total_amount)}</span>
                       </div>
                     ))}
+                  </div>
+                </div>
+
+                <div className="glass-panel history-breakdown-panel">
+                  <div className="history-breakdown-head">
+                    <div>
+                      <span className="admin-pill">Movimientos manuales</span>
+                      <h3>Ingresos y retiros</h3>
+                    </div>
+                  </div>
+                  <div className="cash-register-movement-grid">
+                    <label className="settings-field">
+                      <span>Tipo</span>
+                      <select
+                        className="admin-input admin-input--compact"
+                        value={cashMovementForm.type}
+                        onChange={(event) => updateCashMovementField('type', event.target.value)}
+                      >
+                        <option value="cash_in">Ingreso</option>
+                        <option value="cash_out">Retiro</option>
+                      </select>
+                    </label>
+                    <label className="settings-field">
+                      <span>Monto</span>
+                      <input
+                        className="admin-input admin-input--compact"
+                        type="number"
+                        min="0.01"
+                        step="0.01"
+                        value={cashMovementForm.amount}
+                        onChange={(event) => updateCashMovementField('amount', event.target.value)}
+                      />
+                    </label>
+                    <label className="settings-field settings-field-wide">
+                      <span>Motivo</span>
+                      <input
+                        className="admin-input admin-input--compact"
+                        type="text"
+                        value={cashMovementForm.reason}
+                        onChange={(event) => updateCashMovementField('reason', event.target.value)}
+                        placeholder="Obligatorio"
+                      />
+                    </label>
+                    <div className="cash-register-actions">
+                      <button
+                        className={`btn ${cashMovementForm.type === 'cash_in' ? 'btn-primary' : 'admin-outline-action is-danger'}`}
+                        type="button"
+                        onClick={submitCashMovement}
+                        disabled={isSubmittingCashMovement || Boolean(cashMovementFormError)}
+                      >
+                        {cashMovementForm.type === 'cash_in' ? <ArrowUp size={16} /> : <ArrowDown size={16} />}
+                        {isSubmittingCashMovement
+                          ? 'Guardando...'
+                          : cashMovementForm.type === 'cash_in'
+                            ? 'Registrar ingreso'
+                            : 'Registrar retiro'}
+                      </button>
+                    </div>
+                    {cashMovementFormError && (
+                      <div className="order-economic-note is-error">
+                        {cashMovementFormError}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="glass-panel history-breakdown-panel">
+                  <div className="history-breakdown-head">
+                    <div>
+                      <span className="admin-pill">Movimientos de caja</span>
+                      <h3>Caja actual</h3>
+                    </div>
+                  </div>
+                  <div className="cash-register-movement-list">
+                    {(cashRegisterCurrent.movements || []).length === 0 ? (
+                      <div className="order-empty-state">
+                        <Landmark size={20} />
+                        <div>
+                          <strong>Todavía no hay movimientos registrados.</strong>
+                          <span>Cuando abras caja, cobres en efectivo o cargues ingresos/retiros, aparecen acá.</span>
+                        </div>
+                      </div>
+                    ) : (
+                      (cashRegisterCurrent.movements || []).map((movement) => (
+                        <div className="cash-register-movement-row" key={`cash-movement-${movement.id}`}>
+                          <div>
+                            <strong>
+                              {movement.type === 'opening_float' ? 'Fondo inicial'
+                                : movement.type === 'sale_cash' ? 'Venta cash'
+                                : movement.type === 'refund_cash' ? 'Refund cash'
+                                : movement.type === 'cash_in' ? 'Ingreso manual'
+                                : movement.type === 'cash_out' ? 'Retiro manual'
+                                : 'Ajuste de cierre'}
+                            </strong>
+                            <span>
+                              {formatOrderDateTime(movement.created_at)}
+                              {movement.created_by ? ` · ${formatAuditActorLabel(movement.created_by)}` : ''}
+                              {movement.reason ? ` · ${movement.reason}` : ''}
+                            </span>
+                          </div>
+                          <strong className={movement.direction === 'out' ? 'cash-register-movement-amount is-out' : 'cash-register-movement-amount is-in'}>
+                            {movement.direction === 'out' ? '-' : '+'}{formatMenuMoney(movement.amount)}
+                          </strong>
+                        </div>
+                      ))
+                    )}
                   </div>
                 </div>
 
@@ -5208,6 +6033,10 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
                     <strong>Caja #{session.id}</strong>
                     <span>{session.status === 'open' ? 'Abierta' : `Cerrada ${formatOrderDateTime(session.closed_at)}`}</span>
                     <span>Apertura: {formatMenuMoney(session.opening_float)}</span>
+                    <span>Ventas cash: {formatMenuMoney(session.movement_summary?.sale_cash_amount || 0)}</span>
+                    <span>Refunds cash: {formatMenuMoney(session.movement_summary?.refund_cash_amount || 0)}</span>
+                    <span>Ingresos: {formatMenuMoney(session.movement_summary?.cash_in_amount || 0)}</span>
+                    <span>Retiros: {formatMenuMoney(session.movement_summary?.cash_out_amount || 0)}</span>
                     <span>Esperado cash: {formatMenuMoney(session.expected_cash_amount)}</span>
                     {session.closed_at && (
                       <span>Diferencia: {formatMenuMoney(session.cash_difference)}</span>
@@ -5308,6 +6137,143 @@ export default function AdminPanel({ socket, adminToken, venueSettings, onVenueS
               />
               {settingsErrors.feedback_url && <small className="settings-error">{settingsErrors.feedback_url}</small>}
             </label>
+          </div>
+
+          <div className="settings-panel settings-panel--danger">
+            <div className="settings-panel-header">
+              <div>
+                <h3 className="admin-section-title">Reset de prueba</h3>
+                <p className="admin-section-copy">
+                  Borra pedidos, pagos, solicitudes, historial operativo y caja actual. El menú cargado no se toca.
+                </p>
+              </div>
+              <button
+                className="btn admin-danger-action"
+                type="button"
+                onClick={resetOperationalDemoState}
+                disabled={isResettingOperationalState}
+              >
+                {isResettingOperationalState ? 'Reseteando...' : <><Trash2 size={16} /> Limpiar pedidos y solicitudes</>}
+              </button>
+            </div>
+
+            {operationalResetError ? (
+              <div className="admin-alert is-error is-compact">
+                <strong className="admin-alert-title">No pudimos resetear la demo.</strong>
+                <span className="admin-alert-copy">{operationalResetError}</span>
+              </div>
+            ) : null}
+
+            {operationalResetFeedback ? (
+              <div className="admin-alert is-success is-compact">
+                <strong className="admin-alert-title">Demo reseteada.</strong>
+                <span className="admin-alert-copy">{operationalResetFeedback}</span>
+              </div>
+            ) : null}
+          </div>
+
+          <div className="staff-settings-panel">
+            <div className="settings-panel-header">
+              <div>
+                <h3 className="admin-section-title">Staff operativo</h3>
+                <p className="admin-section-copy">
+                  Creá personas reales con código y PIN para operar sin usar la clave bootstrap.
+                </p>
+              </div>
+            </div>
+
+            {staffActionError ? (
+              <div className="admin-alert is-error is-compact">
+                <strong className="admin-alert-title">No pudimos guardar el staff.</strong>
+                <span className="admin-alert-copy">{staffActionError}</span>
+              </div>
+            ) : null}
+
+            {staffActionSuccess ? (
+              <div className="admin-alert is-success is-compact">
+                <strong className="admin-alert-title">Staff actualizado.</strong>
+                <span className="admin-alert-copy">{staffActionSuccess}</span>
+              </div>
+            ) : null}
+
+            <form className="staff-create-form" onSubmit={createStaffMember}>
+              <label className="settings-field">
+                <span>Nombre</span>
+                <input
+                  className="admin-input admin-input--compact"
+                  value={staffCreateForm.name}
+                  onChange={(event) => updateStaffCreateField('name', event.target.value)}
+                  placeholder="Ej. Ana"
+                />
+              </label>
+              <label className="settings-field">
+                <span>Código</span>
+                <input
+                  className="admin-input admin-input--compact"
+                  value={staffCreateForm.login_code}
+                  onChange={(event) => updateStaffCreateField('login_code', event.target.value)}
+                  placeholder="ANA1"
+                />
+              </label>
+              <label className="settings-field">
+                <span>Rol</span>
+                <select
+                  className="admin-input admin-input--compact"
+                  value={staffCreateForm.role}
+                  onChange={(event) => updateStaffCreateField('role', event.target.value)}
+                >
+                  {STAFF_ROLE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="settings-field">
+                <span>PIN</span>
+                <input
+                  className="admin-input admin-input--compact"
+                  type="password"
+                  inputMode="numeric"
+                  value={staffCreateForm.pin}
+                  onChange={(event) => updateStaffCreateField('pin', event.target.value)}
+                  placeholder="1234"
+                />
+              </label>
+              <div className="staff-create-actions">
+                <button className="btn btn-primary" type="submit" disabled={isCreatingStaff}>
+                  {isCreatingStaff ? 'Creando...' : <><Plus size={16} /> Crear staff</>}
+                </button>
+              </div>
+            </form>
+
+            {staffUsersStatus === 'loading' ? <div className="loader"></div> : null}
+
+            {staffUsersStatus === 'error' ? (
+              <div className="admin-alert is-error is-compact">
+                <strong className="admin-alert-title">No pudimos cargar el staff.</strong>
+                <span className="admin-alert-copy">{staffUsersError}</span>
+              </div>
+            ) : null}
+
+            {staffUsersStatus === 'empty' ? (
+              <div className="order-economic-note">Todavía no hay staff operativo cargado.</div>
+            ) : null}
+
+            {staffUsersStatus === 'ready' ? (
+              <div className="staff-user-list">
+                {staffUsers.map((staffUser) => (
+                  <div className="staff-user-row" key={`staff-${staffUser.id}`}>
+                    <div>
+                      <strong>{staffUser.name}</strong>
+                      <span>{staffUser.login_code}</span>
+                    </div>
+                    <div>
+                      <span>{getRoleLabel(staffUser.role)}</span>
+                      <span>{staffUser.status}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
           </div>
         </section>
       )}

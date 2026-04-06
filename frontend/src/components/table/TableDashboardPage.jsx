@@ -4,7 +4,9 @@ import { useOutletContext } from 'react-router-dom';
 import { formatMoney } from '../../hooks/useTableSession';
 import {
   BILL_PAYMENT_METHOD_OPTIONS,
+  BILL_SPLIT_OPTIONS,
   formatBillPaymentMethodLabel,
+  formatBillSplitChoiceLabel,
 } from '../../lib/billFlow';
 import { getVisibleVenueLinks } from '../../lib/venueSettings';
 import DashboardActionCard from './DashboardActionCard';
@@ -27,6 +29,12 @@ const BILL_METHOD_THEME_CLASS = {
   mercado_pago: 'is-mercado-pago',
 };
 
+const MERCADO_PAGO_MOCK_OPTIONS = [
+  { value: 'approved', label: 'Approved' },
+  { value: 'pending', label: 'Pending' },
+  { value: 'failed', label: 'Failed' },
+];
+
 export default function TableDashboardPage() {
   const {
     tableId,
@@ -40,13 +48,20 @@ export default function TableDashboardPage() {
     activeOrderPaymentStatus,
     activeOrderCustomerStatus,
     billPaymentMethodPreference,
+    billSplitCount,
+    billSplitChoiceLabel,
     cartItemsCount,
     canManageBillFlow,
+    canUpdateBillSplitChoice,
     isWaiterRequested,
     isBillRequested,
     isBillAttended,
+    isBillSplitLocked,
     submittingRequestType,
     canPayWithMercadoPago,
+    mercadoPagoMockMode,
+    mercadoPagoMockResult,
+    mercadoPagoCheckoutState,
     startingMercadoPagoCheckout,
     startMercadoPagoCheckout,
     mercadoPagoActionError,
@@ -60,10 +75,12 @@ export default function TableDashboardPage() {
     clearTableRequestMessages,
     clearMercadoPagoMessages,
     clearOrderStatusFeedback,
+    setMercadoPagoMockResult,
     reloadSession,
   } = useOutletContext();
   const [isBillConfirmOpen, setIsBillConfirmOpen] = useState(false);
   const [selectedBillMethod, setSelectedBillMethod] = useState(billPaymentMethodPreference || 'cash');
+  const [selectedBillSplitCount, setSelectedBillSplitCount] = useState(billSplitCount || 1);
 
   const myOrderBadge = activeOrder ? activeOrderCustomerStatus?.badge || 'En curso' : cartItemsCount > 0 ? 'Pendiente' : '';
   const myOrderSubtitle = activeOrder
@@ -112,12 +129,18 @@ export default function TableDashboardPage() {
     }
 
     setSelectedBillMethod(billPaymentMethodPreference || 'cash');
+    setSelectedBillSplitCount(billSplitCount || 1);
     setIsBillConfirmOpen(true);
   };
 
   const confirmBillRequest = async () => {
+    if (isBillSplitLocked) {
+      return;
+    }
+
     const response = await submitTableRequest('request_bill', {
       preferred_payment_method: selectedBillMethod,
+      split_count: selectedBillSplitCount,
     });
 
     if (!response) {
@@ -125,19 +148,17 @@ export default function TableDashboardPage() {
     }
 
     setIsBillConfirmOpen(false);
-
-    if (selectedBillMethod === 'mercado_pago' && response.should_start_online_checkout) {
-      startMercadoPagoCheckout({ order: response.order });
-    }
   };
 
   const billCardSubtitle = activeOrderPaymentStatus === 'paid'
     ? 'Pago registrado'
     : billPaymentMethodPreference
       ? isBillRequested
-        ? `${formatBillPaymentMethodLabel(billPaymentMethodPreference)} · podés cambiarlo o cancelarlo`
+        ? `${formatBillPaymentMethodLabel(billPaymentMethodPreference)} · ${billSplitChoiceLabel ? billSplitChoiceLabel.toLowerCase() : 'cuenta sin dividir'}`
         : formatBillPaymentMethodLabel(billPaymentMethodPreference)
-      : '';
+      : isBillRequested && billSplitChoiceLabel
+        ? billSplitChoiceLabel
+        : '';
   const billCardBadge = activeOrderPaymentStatus === 'paid'
     ? 'Pagado'
     : isBillAttended
@@ -145,6 +166,16 @@ export default function TableDashboardPage() {
       : isBillRequested
         ? 'Cuenta pedida'
         : '';
+  const shouldShowMercadoPagoState = Boolean(
+    activeOrder?.bill_requested_at
+    && billPaymentMethodPreference === 'mercado_pago'
+    && (
+      canPayWithMercadoPago
+      || mercadoPagoCheckoutState?.isApproved
+      || mercadoPagoCheckoutState?.hasPendingCheckout
+      || mercadoPagoCheckoutState?.hasFailure
+    )
+  );
 
   return (
     <main className="table-dashboard-page">
@@ -199,7 +230,9 @@ export default function TableDashboardPage() {
           badge={billCardBadge}
           hint={
             canCancelBillRequest
-              ? 'Podés cambiar cómo querés pagar o cancelar el pedido de cuenta.'
+              ? isBillSplitLocked
+                ? 'El salón ya empezó a repartir pagos. La división ya no se puede cambiar desde la mesa.'
+                : 'Podés cambiar cómo querés pagar o cómo dividir la cuenta.'
               : ''
           }
           disabled={Boolean(submittingRequestType) || !canManageBillFlow}
@@ -208,8 +241,8 @@ export default function TableDashboardPage() {
         {(canPayWithMercadoPago || startingMercadoPagoCheckout) && (
           <DashboardActionCard
             icon={Wallet}
-            title="Pagar online"
-            subtitle={startingMercadoPagoCheckout ? 'Abriendo Mercado Pago...' : 'Mercado Pago'}
+            title={mercadoPagoCheckoutState?.actionLabel || 'Pagar ahora'}
+            subtitle={startingMercadoPagoCheckout ? 'Abriendo Mercado Pago...' : 'Mercado Pago desde el celular'}
             hint={activeOrderAmountDue > 0 ? `Saldo actual ${formatMoney(activeOrderAmountDue)}` : ''}
             disabled={Boolean(submittingRequestType) || startingMercadoPagoCheckout}
             onClick={startMercadoPagoCheckout}
@@ -274,6 +307,57 @@ export default function TableDashboardPage() {
         </div>
       )}
 
+      {shouldShowMercadoPagoState && (
+        <div className={`glass-panel status-card ${
+          mercadoPagoCheckoutState?.isApproved
+            ? 'status-card-success'
+            : mercadoPagoCheckoutState?.hasFailure
+              ? 'status-card-error'
+              : ''
+        }`}>
+          <div>
+            <strong>{mercadoPagoCheckoutState?.title || 'Pagar la cuenta'}</strong>
+            <span>{mercadoPagoCheckoutState?.message}</span>
+            {activeOrderAmountDue > 0 ? (
+              <span>Saldo pendiente: {formatMoney(activeOrderAmountDue)}</span>
+            ) : mercadoPagoCheckoutState?.isApproved ? (
+              <span>La cuenta ya quedó saldada. El local todavía tiene que cerrar la mesa.</span>
+            ) : null}
+          </div>
+          {mercadoPagoMockMode && activeOrderAmountDue > 0 ? (
+            <div className="mercado-pago-mock-controls">
+              <span className="mercado-pago-mock-label">Modo local</span>
+              <div className="mercado-pago-mock-options">
+                {MERCADO_PAGO_MOCK_OPTIONS.map((option) => (
+                  <button
+                    key={`mock-dashboard-${option.value}`}
+                    className={`btn ${mercadoPagoMockResult === option.value ? 'btn-primary' : ''}`}
+                    type="button"
+                    onClick={() => setMercadoPagoMockResult(option.value)}
+                    disabled={startingMercadoPagoCheckout}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {!mercadoPagoCheckoutState?.isApproved ? (
+            <button
+              className="btn btn-primary"
+              type="button"
+              onClick={startMercadoPagoCheckout}
+              disabled={startingMercadoPagoCheckout}
+            >
+              <Wallet size={16} />
+              {startingMercadoPagoCheckout
+                ? 'Abriendo Mercado Pago...'
+                : mercadoPagoCheckoutState?.actionLabel || 'Pagar ahora'}
+            </button>
+          ) : null}
+        </div>
+      )}
+
       {showGuestFeedbackActions && (
         <section className="glass-panel dashboard-feedback-card">
           <div className="dashboard-feedback-copy">
@@ -335,6 +419,9 @@ export default function TableDashboardPage() {
               <div>
                 <span className="table-confirm-modal-kicker">Cobro de la mesa</span>
                 <h2 id="bill-confirm-title">¿Pedir la cuenta?</h2>
+                <p className="table-confirm-modal-copy">
+                  Elegí cómo querés pagar y si querés dividir la cuenta antes de que el salón empiece a cobrar.
+                </p>
               </div>
             </div>
             <div className="bill-method-choice-grid">
@@ -371,6 +458,34 @@ export default function TableDashboardPage() {
                 })()
               ))}
             </div>
+            <div className="bill-split-choice-shell">
+              <div className="bill-split-choice-head">
+                <strong>¿Cómo quieren dividir la cuenta?</strong>
+                <span>Esto deja preparada la cuenta para que el admin cobre después.</span>
+              </div>
+              <div className="bill-split-choice-grid">
+                {BILL_SPLIT_OPTIONS.map((option) => (
+                  <button
+                    key={`bill-split-${option.value}`}
+                    className={`bill-split-choice ${selectedBillSplitCount === option.value ? 'is-selected' : ''}`}
+                    type="button"
+                    onClick={() => setSelectedBillSplitCount(option.value)}
+                    disabled={Boolean(submittingRequestType) || isBillSplitLocked || !canUpdateBillSplitChoice}
+                  >
+                    <strong>{option.label}</strong>
+                    <span>{option.customer_description}</span>
+                  </button>
+                ))}
+              </div>
+              <div className="bill-split-choice-summary">
+                <span>{formatBillSplitChoiceLabel(selectedBillSplitCount)}</span>
+                {isBillSplitLocked ? (
+                  <span className="bill-split-choice-lock">
+                    Ya empezamos a cobrar esta cuenta. La división no se puede cambiar desde la mesa.
+                  </span>
+                ) : null}
+              </div>
+            </div>
             <div className="table-confirm-modal-actions">
               {canCancelBillRequest && (
                 <button
@@ -380,7 +495,7 @@ export default function TableDashboardPage() {
                     setIsBillConfirmOpen(false);
                     cancelTableRequest('request_bill');
                   }}
-                  disabled={Boolean(submittingRequestType)}
+                  disabled={Boolean(submittingRequestType) || isBillSplitLocked}
                 >
                   <X size={16} />
                   Cancelar pedido
@@ -390,16 +505,21 @@ export default function TableDashboardPage() {
                 <X size={16} />
                 Cancelar
               </button>
-              <button className="btn btn-primary" type="button" onClick={confirmBillRequest} disabled={Boolean(submittingRequestType)}>
+              <button
+                className="btn btn-primary"
+                type="button"
+                onClick={confirmBillRequest}
+                disabled={Boolean(submittingRequestType) || isBillSplitLocked}
+              >
                 {selectedBillMethod === 'mercado_pago' ? <Wallet size={16} /> : <Receipt size={16} />}
                 {submittingRequestType === 'request_bill'
                   ? 'Guardando...'
                   : isBillRequested
                     ? selectedBillMethod === 'mercado_pago'
-                      ? 'Cambiar a Mercado Pago'
+                      ? 'Guardar y pagar después'
                       : 'Actualizar método'
                     : selectedBillMethod === 'mercado_pago'
-                      ? 'Pagar con Mercado Pago'
+                      ? 'Guardar para pagar online'
                       : 'Pedir la cuenta'}
               </button>
             </div>
